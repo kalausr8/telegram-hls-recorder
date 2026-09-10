@@ -1,9 +1,4 @@
-FROM python:3.12-slim
-
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    chromium \
-    && rm -rf /var/lib/apt/lists/*
+FROM mcr.microsoft.com/playwright/python:v1.63.0-noble
 
 WORKDIR /app
 
