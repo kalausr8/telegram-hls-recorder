@@ -1,12 +1,8 @@
 name: HLS Recorder
 
 on:
-  workflow_dispatch:
-    inputs:
-      url:
-        description: "Stream page URL"
-        required: true
-        type: string
+  repository_dispatch:
+    types: [telegram_record]
 
 jobs:
   record:
@@ -41,4 +37,4 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
         run: |
-          python record_once.py "${{ inputs.url }}"
+          python record_once.py "${{ github.event.client_payload.url }}"
