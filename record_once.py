@@ -3,7 +3,6 @@ import os
 import sys
 import signal
 import time
-import json
 import subprocess
 from pathlib import Path
 from urllib.parse import urljoin
@@ -50,8 +49,12 @@ def request_stop(signum, frame):
 
     if not stop_requested:
         stop_requested = True
-        print(f"[STOP] Received signal {signum}. Stopping recording safely...")
-        sys.stdout.flush()
+
+        print(
+            f"[STOP] Received signal {signum}. "
+            "Stopping recording safely...",
+            flush=True
+        )
 
 
 signal.signal(signal.SIGTERM, request_stop)
@@ -81,7 +84,12 @@ def get_size_mb(path):
 # Telegram
 # =========================================================
 
-async def telegram_request(session, method, data=None, timeout=60):
+async def telegram_request(
+    session,
+    method,
+    data=None,
+    timeout=60
+):
     url = (
         f"https://api.telegram.org/"
         f"bot{BOT_TOKEN}/{method}"
@@ -91,7 +99,9 @@ async def telegram_request(session, method, data=None, timeout=60):
         async with session.post(
             url,
             json=data or {},
-            timeout=aiohttp.ClientTimeout(total=timeout)
+            timeout=aiohttp.ClientTimeout(
+                total=timeout
+            )
         ) as response:
 
             text = await response.text()
@@ -102,16 +112,23 @@ async def telegram_request(session, method, data=None, timeout=60):
             )
 
             if response.status >= 400:
-                log(text[:500])
+                log(text[:1000])
 
             return response.status, text
 
     except Exception as exc:
-        log(f"[TELEGRAM ERROR] {method}: {exc}")
+
+        log(
+            f"[TELEGRAM ERROR] {method}: {exc}"
+        )
+
         return 0, ""
 
 
-async def send_message(session, text):
+async def send_message(
+    session,
+    text
+):
     await telegram_request(
         session,
         "sendMessage",
@@ -122,12 +139,17 @@ async def send_message(session, text):
     )
 
 
-async def send_video(session, path):
+async def send_video(
+    session,
+    path
+):
     if not path.exists():
+
         await send_message(
             session,
             "❌ ملف الفيديو غير موجود."
         )
+
         return False
 
     size_mb = get_size_mb(path)
@@ -138,16 +160,19 @@ async def send_video(session, path):
     )
 
     if size_mb >= TELEGRAM_MAX_MB:
+
         await send_message(
             session,
             "⚠️ تم إنشاء الفيديو الكامل، "
             f"لكن حجمه {size_mb:.1f} MB.\n\n"
-            "الفيديو أكبر من الحد الآمن للإرسال عبر Telegram "
-            "في هذا النظام."
+            "الفيديو أكبر من الحد الآمن للإرسال "
+            "عبر Telegram في هذا النظام."
         )
+
         return False
 
     try:
+
         url = (
             f"https://api.telegram.org/"
             f"bot{BOT_TOKEN}/sendVideo"
@@ -178,7 +203,11 @@ async def send_video(session, path):
             f"📦 {size_mb:.1f} MB"
         )
 
-        with open(path, "rb") as video_file:
+        with open(
+            path,
+            "rb"
+        ) as video_file:
+
             form.add_field(
                 "video",
                 video_file,
@@ -200,15 +229,21 @@ async def send_video(session, path):
                 )
 
                 if response.status >= 400:
-                    log(text[:1000])
+
+                    log(
+                        text[:1000]
+                    )
+
                     return False
 
                 return True
 
     except Exception as exc:
+
         log(
             f"[TELEGRAM VIDEO ERROR] {exc}"
         )
+
         return False
 
 
@@ -216,10 +251,14 @@ async def send_video(session, path):
 # Browser headers
 # =========================================================
 
-async def build_headers(page, url):
+async def build_headers(
+    page,
+    url
+):
     headers = {}
 
     try:
+
         ua = await page.evaluate(
             "() => navigator.userAgent"
         )
@@ -232,6 +271,18 @@ async def build_headers(page, url):
 
     headers["Referer"] = url
 
+    try:
+
+        origin = await page.evaluate(
+            "() => location.origin"
+        )
+
+        if origin:
+            headers["Origin"] = origin
+
+    except Exception:
+        pass
+
     return headers
 
 
@@ -239,10 +290,12 @@ async def build_headers(page, url):
 # HLS discovery
 # =========================================================
 
-async def discover_hls(page):
-    found = []
-
+async def inspect_page_for_hls(
+    page,
+    discovered
+):
     def add_url(value):
+
         if not value:
             return
 
@@ -254,47 +307,78 @@ async def discover_hls(page):
         if ".m3u8" not in value.lower():
             return
 
-        if value not in found:
-            found.append(value)
+        if value not in discovered:
+
+            discovered.append(value)
 
             log(
                 f"[HLS] Discovered: {value}"
             )
 
-    async def handle_response(response):
-        try:
-            url = response.url
-
-            if ".m3u8" in url.lower():
-                add_url(url)
-
-        except Exception:
-            pass
-
-    page.on(
-        "response",
-        handle_response
-    )
-
     # -----------------------------------------------------
-    # Also inspect page HTML
+    # Inspect page HTML
     # -----------------------------------------------------
 
     try:
+
         html = await page.content()
 
-        for part in html.split('"'):
-            if ".m3u8" in part.lower():
-                add_url(part)
+        for part in html.replace(
+            "'",
+            '"'
+        ).split('"'):
 
-    except Exception:
-        pass
+            if ".m3u8" in part.lower():
+
+                # In case the URL is embedded inside
+                # a larger string, extract the URL part.
+                lower = part.lower()
+                index = lower.find(".m3u8")
+
+                if index >= 0:
+
+                    start_candidates = [
+                        part.rfind(
+                            "http://",
+                            0,
+                            index
+                        ),
+                        part.rfind(
+                            "https://",
+                            0,
+                            index
+                        )
+                    ]
+
+                    start = max(
+                        start_candidates
+                    )
+
+                    if start >= 0:
+
+                        candidate = part[
+                            start:
+                            index + 5
+                        ]
+
+                        add_url(candidate)
+
+                    else:
+
+                        add_url(part)
+
+    except Exception as exc:
+
+        log(
+            f"[HLS] HTML inspection warning: {exc}"
+        )
 
     # -----------------------------------------------------
     # Inspect performance entries
     # -----------------------------------------------------
 
     try:
+
         entries = await page.evaluate(
             """
             () => performance
@@ -304,12 +388,15 @@ async def discover_hls(page):
         )
 
         for entry in entries:
+
             add_url(entry)
 
-    except Exception:
-        pass
+    except Exception as exc:
 
-    return found
+        log(
+            f"[HLS] Performance inspection warning: "
+            f"{exc}"
+        )
 
 
 # =========================================================
@@ -326,6 +413,7 @@ async def fetch_text(
     )
 
     try:
+
         async with session.get(
             url,
             headers=headers or {},
@@ -341,6 +429,7 @@ async def fetch_text(
             )
 
     except Exception as exc:
+
         log(
             f"[HTTP ERROR] {url}: {exc}"
         )
@@ -363,17 +452,23 @@ async def download_segment(
     )
 
     try:
+
         async with session.get(
             url,
             headers=headers,
             timeout=timeout
         ) as response:
 
-            if response.status != 200:
+            if response.status not in (
+                200,
+                206
+            ):
+
                 log(
                     f"[SEGMENT] HTTP "
                     f"{response.status}: {url}"
                 )
+
                 return False
 
             data = await response.read()
@@ -381,14 +476,18 @@ async def download_segment(
             if not data:
                 return False
 
-            output_path.write_bytes(data)
+            output_path.write_bytes(
+                data
+            )
 
             return True
 
     except Exception as exc:
+
         log(
             f"[SEGMENT ERROR] {exc}"
         )
+
         return False
 
 
@@ -412,12 +511,28 @@ def parse_playlist(
 
     for line in lines:
 
-        if line.startswith("#EXTINF:"):
+        if line.startswith(
+            "#EXTINF:"
+        ):
+
             try:
-                value = line.split(":", 1)[1]
-                value = value.split(",", 1)[0]
-                current_duration = float(value)
+
+                value = line.split(
+                    ":",
+                    1
+                )[1]
+
+                value = value.split(
+                    ",",
+                    1
+                )[0]
+
+                current_duration = float(
+                    value
+                )
+
             except Exception:
+
                 current_duration = 0.0
 
             continue
@@ -454,11 +569,27 @@ async def find_live_playlist(
     candidates = []
 
     for url in discovered_urls:
+
         if url not in candidates:
             candidates.append(url)
 
-    # Try each discovered playlist
-    for url in candidates:
+    checked = set()
+
+    # -----------------------------------------------------
+    # First pass
+    # -----------------------------------------------------
+
+    position = 0
+
+    while position < len(candidates):
+
+        url = candidates[position]
+        position += 1
+
+        if url in checked:
+            continue
+
+        checked.add(url)
 
         status, text, _ = await fetch_text(
             session,
@@ -472,7 +603,10 @@ async def find_live_playlist(
         if "#EXTM3U" not in text:
             continue
 
+        # -------------------------------------------------
         # Master playlist
+        # -------------------------------------------------
+
         if "#EXT-X-STREAM-INF" in text:
 
             lines = [
@@ -483,30 +617,63 @@ async def find_live_playlist(
 
             for i, line in enumerate(lines):
 
-                if line.startswith(
+                if not line.startswith(
                     "#EXT-X-STREAM-INF"
                 ):
-                    if i + 1 < len(lines):
+                    continue
 
-                        child = lines[i + 1]
+                # Find the URI following STREAM-INF.
+                child = None
 
-                        if child.startswith("#"):
-                            continue
+                for j in range(
+                    i + 1,
+                    len(lines)
+                ):
 
-                        child_url = urljoin(
-                            url,
-                            child
-                        )
+                    candidate = lines[j]
 
-                        candidates.append(
-                            child_url
-                        )
+                    if candidate.startswith("#"):
+                        continue
 
-        else:
+                    child = candidate
+                    break
+
+                if not child:
+                    continue
+
+                child_url = urljoin(
+                    url,
+                    child
+                )
+
+                if child_url not in candidates:
+
+                    candidates.append(
+                        child_url
+                    )
+
+            continue
+
+        # -------------------------------------------------
+        # Media playlist
+        # -------------------------------------------------
+
+        if (
+            "#EXTINF:" in text
+            or
+            "#EXT-X-TARGETDURATION" in text
+        ):
+
             return url, text
 
-    # Retry candidates created from master playlists
+    # -----------------------------------------------------
+    # Second pass
+    # -----------------------------------------------------
+
     for url in candidates:
+
+        if url in checked:
+            continue
 
         status, text, _ = await fetch_text(
             session,
@@ -517,10 +684,15 @@ async def find_live_playlist(
         if status != 200:
             continue
 
-        if "#EXTM3U" in text and (
-            "#EXTINF:" in text or
+        if "#EXTM3U" not in text:
+            continue
+
+        if (
+            "#EXTINF:" in text
+            or
             "#EXT-X-TARGETDURATION" in text
         ):
+
             return url, text
 
     return None, None
@@ -530,7 +702,9 @@ async def find_live_playlist(
 # Build MP4 from downloaded segments
 # =========================================================
 
-def build_full_video(segment_paths):
+def build_full_video(
+    segment_paths
+):
     if not segment_paths:
         return False
 
@@ -547,14 +721,19 @@ def build_full_video(segment_paths):
     valid_paths = [
         path
         for path in segment_paths
-        if path.exists() and path.stat().st_size > 0
+        if (
+            path.exists()
+            and
+            path.stat().st_size > 0
+        )
     ]
 
     if not valid_paths:
         return False
 
     log(
-        f"[MUX] Preparing {len(valid_paths)} segments..."
+        f"[MUX] Preparing "
+        f"{len(valid_paths)} segments..."
     )
 
     with open(
@@ -564,7 +743,10 @@ def build_full_video(segment_paths):
     ) as f:
 
         for path in valid_paths:
-            escaped = str(path.resolve()).replace(
+
+            escaped = str(
+                path.resolve()
+            ).replace(
                 "'",
                 "'\\''"
             )
@@ -574,6 +756,7 @@ def build_full_video(segment_paths):
             )
 
     if FULL_VIDEO.exists():
+
         try:
             FULL_VIDEO.unlink()
         except Exception:
@@ -603,6 +786,7 @@ def build_full_video(segment_paths):
     )
 
     try:
+
         result = subprocess.run(
             command,
             stdout=subprocess.PIPE,
@@ -612,12 +796,13 @@ def build_full_video(segment_paths):
         )
 
         if result.returncode != 0:
+
             log(
                 "[MUX ERROR]"
             )
 
             log(
-                result.stderr[-3000:]
+                result.stderr[-5000:]
             )
 
             return False
@@ -636,15 +821,19 @@ def build_full_video(segment_paths):
         return True
 
     except subprocess.TimeoutExpired:
+
         log(
             "[MUX ERROR] FFmpeg timeout."
         )
+
         return False
 
     except Exception as exc:
+
         log(
             f"[MUX ERROR] {exc}"
         )
+
         return False
 
 
@@ -689,21 +878,31 @@ async def main():
 
         browser = None
         playwright = None
+        context = None
+        page = None
 
         segment_paths = []
         known_segments = set()
 
         total_duration = 0.0
+
         last_success = time.monotonic()
 
         playlist_url = None
 
+        # This list is intentionally persistent.
+        # The response listener is attached BEFORE page.goto().
+        discovered = []
+
         try:
+
             # -------------------------------------------------
             # Playwright
             # -------------------------------------------------
 
-            playwright = await async_playwright().start()
+            playwright = (
+                await async_playwright().start()
+            )
 
             browser = await playwright.chromium.launch(
                 headless=True,
@@ -727,27 +926,122 @@ async def main():
 
             page = await context.new_page()
 
-            await page.goto(
-                PAGE_URL,
-                wait_until="domcontentloaded",
-                timeout=PAGE_TIMEOUT * 1000
+            # =================================================
+            # IMPORTANT:
+            # Attach HLS response listener BEFORE goto().
+            # =================================================
+
+            async def handle_response(
+                response
+            ):
+                try:
+
+                    response_url = response.url
+
+                    if (
+                        ".m3u8"
+                        not in
+                        response_url.lower()
+                    ):
+                        return
+
+                    if response_url not in discovered:
+
+                        discovered.append(
+                            response_url
+                        )
+
+                        log(
+                            "[HLS] Discovered from "
+                            "network response: "
+                            f"{response_url}"
+                        )
+
+                except Exception:
+                    pass
+
+            page.on(
+                "response",
+                handle_response
             )
 
-            await page.wait_for_timeout(5000)
-
             # -------------------------------------------------
-            # Discover HLS
+            # Open stream page
             # -------------------------------------------------
 
-            discovered = await discover_hls(page)
+            try:
+
+                await page.goto(
+                    PAGE_URL,
+                    wait_until="domcontentloaded",
+                    timeout=PAGE_TIMEOUT * 1000
+                )
+
+            except Exception as exc:
+
+                log(
+                    f"[PAGE] Navigation warning: {exc}"
+                )
+
+                # The page may still have loaded enough
+                # for the player to start.
+
+            # Give player time to initialize.
+
+            await page.wait_for_timeout(
+                5000
+            )
+
+            # -------------------------------------------------
+            # Inspect page after initial load
+            # -------------------------------------------------
+
+            await inspect_page_for_hls(
+                page,
+                discovered
+            )
+
+            # -------------------------------------------------
+            # Wait for HLS discovery
+            # -------------------------------------------------
 
             if not discovered:
+
                 log(
                     "[HLS] No playlist found immediately. "
                     "Waiting for network activity..."
                 )
 
-                for _ in range(20):
+                discovery_deadline = (
+                    time.monotonic()
+                    + 30
+                )
+
+                while (
+                    not discovered
+                    and
+                    not stop_requested
+                    and
+                    time.monotonic()
+                    < discovery_deadline
+                ):
+
+                    await page.wait_for_timeout(
+                        1000
+                    )
+
+                    await inspect_page_for_hls(
+                        page,
+                        discovered
+                    )
+
+            else:
+
+                # Even if something was found,
+                # give the player a little extra time
+                # to expose its actual media playlist.
+
+                for _ in range(5):
 
                     if stop_requested:
                         break
@@ -756,35 +1050,67 @@ async def main():
                         1000
                     )
 
-                    discovered = await discover_hls(
-                        page
+                    await inspect_page_for_hls(
+                        page,
+                        discovered
                     )
 
-                    if discovered:
-                        break
-
             if stop_requested:
+
                 log(
                     "[STOP] Stop requested before HLS started."
                 )
+
                 return
+
+            if not discovered:
+
+                await send_message(
+                    session,
+                    "❌ لم يتم العثور على رابط HLS/m3u8 "
+                    "من صفحة البث."
+                )
+
+                log(
+                    "[HLS] No m3u8 URL discovered."
+                )
+
+                return
+
+            # -------------------------------------------------
+            # Build browser headers
+            # -------------------------------------------------
 
             headers = await build_headers(
                 page,
                 PAGE_URL
             )
 
-            playlist_url, playlist = await find_live_playlist(
-                session,
-                discovered,
-                headers
+            # -------------------------------------------------
+            # Find actual media playlist
+            # -------------------------------------------------
+
+            playlist_url, playlist = (
+                await find_live_playlist(
+                    session,
+                    discovered,
+                    headers
+                )
             )
 
             if not playlist_url:
+
+                log(
+                    "[HLS] Discovered URLs were not "
+                    "usable media playlists."
+                )
+
                 await send_message(
                     session,
-                    "❌ لم يتم العثور على HLS/m3u8 للبث."
+                    "❌ تم اكتشاف HLS لكن تعذر الوصول "
+                    "إلى قائمة المقاطع الخاصة بالبث."
                 )
+
                 return
 
             log(
@@ -802,63 +1128,108 @@ async def main():
 
             while not stop_requested:
 
-                status, manifest, _ = await fetch_text(
-                    session,
-                    playlist_url,
-                    headers
+                # Refresh browser headers.
+                headers = await build_headers(
+                    page,
+                    PAGE_URL
                 )
 
+                status, manifest, _ = (
+                    await fetch_text(
+                        session,
+                        playlist_url,
+                        headers
+                    )
+                )
+
+                # -------------------------------------------------
+                # Authentication / playlist failure
+                # -------------------------------------------------
+
                 if status == 401:
+
                     log(
                         "[HLS] 401 Unauthorized. "
                         "Trying to rediscover playlist..."
                     )
 
-                    discovered = await discover_hls(
-                        page
+                    await inspect_page_for_hls(
+                        page,
+                        discovered
                     )
 
-                    new_url, new_manifest = await find_live_playlist(
-                        session,
-                        discovered,
-                        headers
+                    new_url, new_manifest = (
+                        await find_live_playlist(
+                            session,
+                            discovered,
+                            headers
+                        )
                     )
 
                     if new_url:
+
                         playlist_url = new_url
                         manifest = new_manifest
                         status = 200
 
-                if status != 200 or not manifest:
-                    elapsed = time.monotonic() - last_success
+                        log(
+                            "[HLS] Switched to refreshed "
+                            f"playlist: {playlist_url}"
+                        )
+
+                if (
+                    status != 200
+                    or
+                    not manifest
+                ):
+
+                    elapsed = (
+                        time.monotonic()
+                        - last_success
+                    )
 
                     log(
-                        f"[HLS] Manifest unavailable. "
+                        "[HLS] Manifest unavailable. "
                         f"HTTP={status}, "
                         f"failure={elapsed:.0f}s"
                     )
 
                     if (
-                        elapsed >
+                        elapsed
+                        >
                         MAX_SOURCE_FAILURE_SECONDS
                     ):
+
                         await send_message(
                             session,
                             "❌ توقف مصدر البث لأكثر من 5 دقائق."
                         )
+
                         break
 
                     await asyncio.sleep(
                         POLL_SECONDS
                     )
+
                     continue
 
                 last_success = time.monotonic()
+
+                # -------------------------------------------------
+                # Parse playlist
+                # -------------------------------------------------
 
                 parsed = parse_playlist(
                     manifest,
                     playlist_url
                 )
+
+                if not parsed:
+
+                    log(
+                        "[HLS] Playlist contains "
+                        "no segments yet."
+                    )
 
                 # -------------------------------------------------
                 # Download new segments
@@ -873,22 +1244,29 @@ async def main():
                         continue
 
                     index = (
-                        len(segment_paths) + 1
+                        len(segment_paths)
+                        + 1
                     )
 
-                    output_path = safe_filename(index)
+                    output_path = safe_filename(
+                        index
+                    )
 
-                    success = await download_segment(
-                        session,
-                        segment_url,
-                        output_path,
-                        headers
+                    success = (
+                        await download_segment(
+                            session,
+                            segment_url,
+                            output_path,
+                            headers
+                        )
                     )
 
                     if not success:
                         continue
 
-                    # Only mark as known after successful download
+                    # Only mark as known after
+                    # successful download.
+
                     known_segments.add(
                         segment_url
                     )
@@ -901,20 +1279,28 @@ async def main():
                         total_duration += duration
 
                     log(
-                        f"Segment {len(segment_paths)} "
+                        f"Segment "
+                        f"{len(segment_paths)} "
                         f"+{duration:.2f}s "
-                        f"total={total_duration:.1f}s"
+                        f"total="
+                        f"{total_duration:.1f}s"
                     )
 
                 # -------------------------------------------------
                 # VOD / ended stream
                 # -------------------------------------------------
 
-                if "#EXT-X-ENDLIST" in manifest:
+                if (
+                    "#EXT-X-ENDLIST"
+                    in
+                    manifest
+                ):
+
                     log(
                         "[HLS] ENDLIST detected. "
                         "Stream finished."
                     )
+
                     break
 
                 await asyncio.sleep(
@@ -922,6 +1308,7 @@ async def main():
                 )
 
         except asyncio.CancelledError:
+
             stop_requested = True
 
             log(
@@ -929,23 +1316,27 @@ async def main():
             )
 
         except Exception as exc:
+
             log(
-                f"[RECORDER ERROR] {type(exc).__name__}: {exc}"
+                f"[RECORDER ERROR] "
+                f"{type(exc).__name__}: {exc}"
             )
 
             try:
+
                 await send_message(
                     session,
                     "❌ حدث خطأ أثناء التسجيل:\n"
                     f"{type(exc).__name__}: {exc}"
                 )
+
             except Exception:
                 pass
 
         finally:
+
             # =================================================
-            # IMPORTANT:
-            # Always finish the recording before exiting.
+            # Always finalize recording before exiting.
             # =================================================
 
             log(
@@ -957,17 +1348,23 @@ async def main():
             # -------------------------------------------------
 
             try:
+
                 if browser:
                     await browser.close()
+
             except Exception as exc:
+
                 log(
                     f"[BROWSER CLOSE] {exc}"
                 )
 
             try:
+
                 if playwright:
                     await playwright.stop()
+
             except Exception as exc:
+
                 log(
                     f"[PLAYWRIGHT CLOSE] {exc}"
                 )
@@ -977,15 +1374,18 @@ async def main():
             # -------------------------------------------------
 
             if not segment_paths:
+
                 log(
                     "[MUX] No recorded segments."
                 )
 
                 try:
+
                     await send_message(
                         session,
                         "❌ لم يتم تسجيل أي جزء من البث."
                     )
+
                 except Exception:
                     pass
 
@@ -1001,11 +1401,14 @@ async def main():
             )
 
             if not success:
+
                 try:
+
                     await send_message(
                         session,
                         "❌ فشل إنشاء الفيديو الكامل MP4."
                     )
+
                 except Exception:
                     pass
 
@@ -1021,7 +1424,10 @@ async def main():
             )
 
             if sent:
-                minutes = total_duration / 60
+
+                minutes = (
+                    total_duration / 60
+                )
 
                 await send_message(
                     session,
@@ -1040,15 +1446,22 @@ async def main():
 # =========================================================
 
 if __name__ == "__main__":
+
     try:
-        asyncio.run(main())
+
+        asyncio.run(
+            main()
+        )
 
     except KeyboardInterrupt:
+
         log(
             "[STOP] Keyboard interrupt."
         )
 
     except Exception as exc:
+
         log(
-            f"[FATAL] {type(exc).__name__}: {exc}"
+            f"[FATAL] "
+            f"{type(exc).__name__}: {exc}"
         )
