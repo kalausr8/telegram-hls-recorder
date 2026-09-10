@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -24,16 +23,16 @@ CHUNK_DIR = WORK_DIR / "chunks"
 SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
 CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 
-# نرسل جزءًا كل 60 ثانية تقريبًا
+# إرسال جزء كل 60 ثانية تقريبًا
 TARGET_CHUNK_SECONDS = 60
 
 # فحص HLS كل ثانيتين
 POLL_SECONDS = 2
 
-# محاولات تحميل segment
+# عدد محاولات تحميل segment
 SEGMENT_RETRIES = 3
 
-# بعد هذا العدد من أخطاء 401 نحاول إعادة تحميل صفحة البث
+# بعد هذا العدد من 401 نعيد تحميل صفحة البث
 MAX_401_BEFORE_RELOAD = 2
 
 # إذا لم نستطع الوصول للمصدر لمدة 5 دقائق
@@ -43,7 +42,9 @@ SOURCE_TIMEOUT_SECONDS = 300
 def parse_attributes(text):
     result = {}
 
-    pattern = re.compile(r'([A-Z0-9-]+)=("([^"]*)"|[^,]*)')
+    pattern = re.compile(
+        r'([A-Z0-9-]+)=("([^"]*)"|[^,]*)'
+    )
 
     for match in pattern.finditer(text):
         key = match.group(1)
@@ -76,6 +77,7 @@ def parse_hls(text, base_url):
         variants = []
 
         for i, line in enumerate(lines):
+
             if not line.startswith("#EXT-X-STREAM-INF"):
                 continue
 
@@ -86,6 +88,7 @@ def parse_hls(text, base_url):
             variant_url = None
 
             for j in range(i + 1, len(lines)):
+
                 candidate = lines[j]
 
                 if candidate.startswith("#"):
@@ -95,22 +98,28 @@ def parse_hls(text, base_url):
                     base_url,
                     candidate
                 )
+
                 break
 
             if not variant_url:
                 continue
 
-            resolution = attrs.get("RESOLUTION", "")
+            resolution = attrs.get(
+                "RESOLUTION",
+                ""
+            )
 
             width = None
             height = None
 
             if "x" in resolution:
+
                 try:
                     width, height = map(
                         int,
                         resolution.split("x", 1)
                     )
+
                 except Exception:
                     pass
 
@@ -143,48 +152,72 @@ def parse_hls(text, base_url):
         }
 
     segments = []
+
     init_map = None
+
     target_duration = 6
+
     pending_duration = 0
     pending_range = None
 
     for line in lines:
 
-        if line.startswith("#EXT-X-TARGETDURATION"):
+        if line.startswith(
+            "#EXT-X-TARGETDURATION"
+        ):
+
             try:
                 target_duration = int(
                     line.split(":", 1)[1]
                 )
+
             except Exception:
                 pass
 
         elif line.startswith("#EXT-X-MAP"):
+
             attrs = parse_attributes(
                 line.split(":", 1)[1]
             )
 
-            uri = attrs.get("URI", "").strip('"')
+            uri = attrs.get(
+                "URI",
+                ""
+            ).strip('"')
 
             if uri:
+
                 init_map = {
                     "url": urljoin(
                         base_url,
                         uri
                     ),
-                    "range": attrs.get("BYTERANGE")
+                    "range": attrs.get(
+                        "BYTERANGE"
+                    )
                 }
 
         elif line.startswith("#EXTINF"):
-            value = line.split(":", 1)[1]
+
+            value = line.split(
+                ":",
+                1
+            )[1]
 
             try:
+
                 pending_duration = float(
                     value.split(",", 1)[0]
                 )
+
             except Exception:
+
                 pending_duration = 0
 
-        elif line.startswith("#EXT-X-BYTERANGE"):
+        elif line.startswith(
+            "#EXT-X-BYTERANGE"
+        ):
+
             pending_range = (
                 line.split(":", 1)[1]
                 .strip()
@@ -216,10 +249,12 @@ def parse_hls(text, base_url):
 
 
 def range_header(value):
+
     if not value:
         return None
 
     try:
+
         parts = value.split("@")
 
         length = int(parts[0])
@@ -235,6 +270,7 @@ def range_header(value):
         )
 
     except Exception:
+
         return None
 
 
@@ -253,9 +289,12 @@ async def download_bytes(
 
     last_error = None
 
-    for attempt in range(SEGMENT_RETRIES):
+    for attempt in range(
+        SEGMENT_RETRIES
+    ):
 
         try:
+
             async with session.get(
                 url,
                 headers=request_headers,
@@ -264,9 +303,13 @@ async def download_bytes(
                 )
             ) as response:
 
-                if response.status not in (200, 206):
+                if response.status not in (
+                    200,
+                    206
+                ):
 
                     if response.status == 401:
+
                         raise PermissionError(
                             "HTTP 401"
                         )
@@ -275,10 +318,9 @@ async def download_bytes(
                         f"HTTP {response.status}"
                     )
 
-                return (
-                    await response.read(),
-                    response.status
-                )
+                data = await response.read()
+
+                return data, response.status
 
         except Exception as error:
 
@@ -291,9 +333,14 @@ async def download_bytes(
             )
 
             if attempt + 1 < SEGMENT_RETRIES:
+
                 await asyncio.sleep(1)
 
-    if isinstance(last_error, PermissionError):
+    if isinstance(
+        last_error,
+        PermissionError
+    ):
+
         return None, 401
 
     return None, None
@@ -314,19 +361,19 @@ async def fetch_playlist(
             )
         ) as response:
 
-            if response.status != 200:
+            if response.status == 401:
 
-                if response.status == 401:
-                    return None, 401
+                return None, 401
+
+            if response.status != 200:
 
                 raise RuntimeError(
                     f"Playlist HTTP {response.status}"
                 )
 
-            return (
-                await response.text(),
-                200
-            )
+            text = await response.text()
+
+            return text, 200
 
     except aiohttp.ClientError as error:
 
@@ -338,7 +385,10 @@ async def fetch_playlist(
         return None, None
 
 
-async def build_headers(page, page_url):
+async def build_headers(
+    page,
+    page_url
+):
     user_agent = await page.evaluate(
         "() => navigator.userAgent"
     )
@@ -362,6 +412,7 @@ async def build_headers(page, page_url):
     }
 
     if cookie_header:
+
         headers["Cookie"] = cookie_header
 
     return headers
@@ -372,14 +423,9 @@ async def discover_and_refresh(
     discovered,
     current_manifest
 ):
-    """
-    نعيد تحميل صفحة البث عند الحاجة.
-    الصفحة نفسها تعيد طلب HLS جديدًا،
-    ونلتقط أحدث manifest من network.
-    """
-
     print(
-        "Refreshing stream page to renew HLS session..."
+        "Refreshing stream page "
+        "to renew HLS session..."
     )
 
     before_count = len(discovered)
@@ -408,7 +454,6 @@ async def discover_and_refresh(
 
     if discovered:
 
-        # نفضّل آخر رابط live.m3u8
         live_urls = [
             url
             for url in discovered
@@ -416,14 +461,20 @@ async def discover_and_refresh(
         ]
 
         if live_urls:
+
             new_manifest = live_urls[-1]
+
         else:
+
             new_manifest = discovered[-1]
 
         if new_manifest != current_manifest:
 
             print(
-                "New HLS manifest discovered:",
+                "New HLS manifest discovered:"
+            )
+
+            print(
                 new_manifest
             )
 
@@ -433,23 +484,20 @@ async def discover_and_refresh(
 
 
 async def discover_hls():
-    """
-    يفتح صفحة البث ويبقي Playwright مفتوحًا.
-    يرجع:
-      playwright
-      browser
-      context
-      page
-      manifest_url
-      headers
-      discovered
-    """
 
-    playwright = await async_playwright().start()
+    print(
+        "Opening stream page..."
+    )
+
+    playwright = (
+        await async_playwright().start()
+    )
 
     browser = await playwright.chromium.launch(
         headless=True,
-        args=["--no-sandbox"]
+        args=[
+            "--no-sandbox"
+        ]
     )
 
     context = await browser.new_context()
@@ -458,8 +506,9 @@ async def discover_hls():
 
     discovered = []
 
-    async def response_handler(response):
-
+    async def response_handler(
+        response
+    ):
         url = response.url
 
         if ".m3u8" not in url.lower():
@@ -479,15 +528,20 @@ async def discover_hls():
         response_handler
     )
 
-    print(
-        "Opening stream page..."
-    )
+    try:
 
-    await page.goto(
-        PAGE_URL,
-        wait_until="domcontentloaded",
-        timeout=60000
-    )
+        await page.goto(
+            PAGE_URL,
+            wait_until="domcontentloaded",
+            timeout=60000
+        )
+
+    except Exception:
+
+        await browser.close()
+        await playwright.stop()
+
+        raise
 
     for _ in range(30):
 
@@ -512,8 +566,11 @@ async def discover_hls():
     ]
 
     if live_urls:
+
         manifest_url = live_urls[-1]
+
     else:
+
         manifest_url = discovered[-1]
 
     headers = await build_headers(
@@ -536,8 +593,10 @@ async def mux_chunk(
     files,
     output_file
 ):
-    concat_file = output_file.with_suffix(
-        ".txt"
+    concat_file = (
+        output_file.with_suffix(
+            ".txt"
+        )
     )
 
     with open(
@@ -556,8 +615,7 @@ async def mux_chunk(
             )
 
             file.write(
-                "file "
-                + "'"
+                "file '"
                 + path
                 + "'\n"
             )
@@ -565,22 +623,16 @@ async def mux_chunk(
     command = [
         "ffmpeg",
         "-y",
-
         "-f",
         "concat",
-
         "-safe",
         "0",
-
         "-i",
         str(concat_file),
-
         "-c",
         "copy",
-
         "-movflags",
         "+faststart",
-
         str(output_file),
     ]
 
@@ -597,7 +649,9 @@ async def mux_chunk(
         )
     )
 
-    _, stderr = await process.communicate()
+    _, stderr = (
+        await process.communicate()
+    )
 
     concat_file.unlink(
         missing_ok=True
@@ -631,7 +685,7 @@ async def send_chunk(
         f"{size_mb:.1f} MB"
     )
 
-    # هامش أمان تحت حد Telegram
+    # هامش أمان
     if size_mb >= 49:
 
         print(
@@ -679,7 +733,9 @@ async def main():
         manifest_url
     )
 
-    bot = Bot(BOT_TOKEN)
+    bot = Bot(
+        BOT_TOKEN
+    )
 
     timeout = aiohttp.ClientTimeout(
         total=90
@@ -697,14 +753,17 @@ async def main():
         known_segments = set()
 
         current_files = []
+
         current_duration = 0
 
         chunk_number = 0
 
         total_duration = 0
+
         total_segments = 0
 
         init_downloaded = False
+
         init_file = None
 
         last_successful_poll = time.time()
@@ -717,9 +776,9 @@ async def main():
 
         try:
 
-            # ---------------------------------------------
-            # أولًا: إذا كان manifest Master
-            # ---------------------------------------------
+            # =============================================
+            # الحصول على أول Playlist
+            # =============================================
 
             playlist_text, status = (
                 await fetch_playlist(
@@ -763,6 +822,10 @@ async def main():
                 manifest_url
             )
 
+            # =============================================
+            # إذا كان Master Playlist
+            # =============================================
+
             if parsed["type"] == "master":
 
                 variants = parsed["variants"]
@@ -773,6 +836,7 @@ async def main():
                         "No HLS variants found"
                     )
 
+                # نختار أعلى جودة متاحة
                 selected = variants[0]
 
                 manifest_url = selected["url"]
@@ -833,16 +897,15 @@ async def main():
                     "Could not obtain media playlist"
                 )
 
-            # ---------------------------------------------
+            # =============================================
             # التسجيل المستمر
-            # ---------------------------------------------
+            # =============================================
 
             while True:
 
                 try:
 
-                    # تحديث headers من جلسة Playwright
-                    # لأن cookies قد تتغير أثناء البث
+                    # تحديث Cookies وheaders من المتصفح
                     headers = await build_headers(
                         page,
                         PAGE_URL
@@ -856,9 +919,9 @@ async def main():
                         )
                     )
 
-                    # -----------------------------------------
-                    # 401 = الرابط القديم لم يعد صالحًا
-                    # -----------------------------------------
+                    # -------------------------------------
+                    # التعامل مع 401
+                    # -------------------------------------
 
                     if status == 401:
 
@@ -869,8 +932,7 @@ async def main():
                             f"({consecutive_401})"
                         )
 
-                        # نحاول أولًا استخدام آخر manifest
-                        # اكتشفته Playwright
+                        # أولًا نبحث عن أحدث live.m3u8
                         live_urls = [
                             url
                             for url in discovered
@@ -895,7 +957,7 @@ async def main():
 
                                 manifest_url = candidate
 
-                        # إذا استمر 401، نجدد صفحة البث
+                        # إذا استمر 401 نعيد تحميل الصفحة
                         if (
                             consecutive_401
                             >= MAX_401_BEFORE_RELOAD
@@ -914,15 +976,4 @@ async def main():
                                     page,
                                     PAGE_URL
                                 )
-                            )
-
-                            consecutive_401 = 0
-
-                        await asyncio.sleep(1)
-
-                        continue
-
-                    if status != 200 or not playlist_text:
-
-                        print(
-                         
+                          
