@@ -1,8 +1,9 @@
+import asyncio
 import os
 import re
-import sys
-import asyncio
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 from playwright.async_api import async_playwright
@@ -10,257 +11,201 @@ from telegram import Bot
 
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
+CHAT_ID = os.environ["ADMIN_USER_ID"]
 
-WORK_DIR = Path("/tmp/hls-recordings")
-WORK_DIR.mkdir(parents=True, exist_ok=True)
+PAGE_URL = sys.argv[1]
+
+OUTPUT_DIR = Path("recordings")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+SEGMENT_TIME = 120  # دقيقتان لكل جزء
 
 
-async def find_m3u8(page_url: str):
-    found = []
-    headers = {}
+async def find_stream(page):
+    found = None
+
+    def handle_response(response):
+        nonlocal found
+        url = response.url
+
+        if ".m3u8" in url.lower() and found is None:
+            found = url
+            print("M3U8 FOUND:", url)
+
+    page.on("response", handle_response)
+
+    await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+
+    # إعطاء الصفحة وقتًا لاكتشاف البث
+    for _ in range(30):
+        if found:
+            break
+        await asyncio.sleep(1)
+
+    return found
+
+
+async def main():
+    print("Opening stream page...")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
+            args=["--no-sandbox"]
         )
 
-        context = await browser.new_context(
-            ignore_https_errors=True
+        page = await browser.new_page()
+
+        m3u8_url = await find_stream(page)
+
+        if not m3u8_url:
+            print("ERROR: m3u8 not found")
+            await browser.close()
+            return
+
+        user_agent = await page.evaluate("navigator.userAgent")
+
+        cookies = await page.context.cookies()
+        cookie_header = "; ".join(
+            f"{c['name']}={c['value']}" for c in cookies
         )
-
-        page = await context.new_page()
-
-        async def on_request(request):
-            url = request.url.lower()
-
-            if ".m3u8" in url:
-                if request.url not in found:
-                    found.append(request.url)
-
-                    if not headers:
-                        request_headers = request.headers
-
-                        headers.update({
-                            "User-Agent": request_headers.get(
-                                "user-agent", ""
-                            ),
-                            "Referer": request_headers.get(
-                                "referer", page_url
-                            ),
-                            "Origin": request_headers.get(
-                                "origin", ""
-                            ),
-                        })
-
-        page.on("request", on_request)
-
-        print("Opening stream page...")
-
-        await page.goto(
-            page_url,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-
-        await page.wait_for_timeout(10000)
-
-        try:
-            await page.locator("video").first.evaluate(
-                """video => {
-                    video.muted = true;
-                    video.play().catch(() => {});
-                }"""
-            )
-        except Exception:
-            pass
-
-        await page.wait_for_timeout(10000)
-
-        cookies = await context.cookies()
 
         await browser.close()
 
-    if not found:
-        return None, None
+    print("Starting recording...")
 
-    selected = found[0]
+    output_pattern = str(
+        OUTPUT_DIR / "part_%03d.mp4"
+    )
 
-    for url in found:
-        if "master" in url.lower():
-            selected = url
-            break
-
-    cookie_header = "; ".join(
-        f"{c['name']}={c['value']}"
-        for c in cookies
+    headers = (
+        f"User-Agent: {user_agent}\r\n"
+        f"Referer: {PAGE_URL}\r\n"
     )
 
     if cookie_header:
-        headers["Cookie"] = cookie_header
+        headers += f"Cookie: {cookie_header}\r\n"
 
-    return selected, headers
-
-
-def build_ffmpeg_command(
-    m3u8_url: str,
-    headers: dict,
-    output: Path,
-):
-    header_lines = []
-
-    for key in (
-        "User-Agent",
-        "Referer",
-        "Origin",
-        "Cookie",
-    ):
-        value = headers.get(key)
-
-        if value:
-            header_lines.append(
-                f"{key}: {value}"
-            )
-
-    return [
+    command = [
         "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-
-        "-reconnect",
-        "1",
-        "-reconnect_streamed",
-        "1",
-        "-reconnect_delay_max",
-        "10",
+        "-y",
 
         "-headers",
-        "".join(
-            f"{line}\r\n"
-            for line in header_lines
-        ),
+        headers,
 
         "-i",
         m3u8_url,
 
-        "-map",
-        "0",
         "-c",
         "copy",
 
-        "-movflags",
-        "+faststart",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(SEGMENT_TIME),
+        "-reset_timestamps",
+        "1",
 
-        str(output),
+        output_pattern,
     ]
 
+    process = subprocess.Popen(command)
 
-async def send_file(output: Path):
-    if not output.exists():
-        return
+    bot = Bot(BOT_TOKEN)
 
-    size = output.stat().st_size
-
-    bot = Bot(token=BOT_TOKEN)
-
-    await bot.send_message(
-        chat_id=ADMIN_USER_ID,
-        text=(
-            "🎥 انتهى التسجيل التجريبي.\n"
-            f"حجم الملف: {size / 1024 / 1024:.1f} MB"
-        ),
-    )
-
-    if size <= 49 * 1024 * 1024:
-        with output.open("rb") as video:
-            await bot.send_document(
-                chat_id=ADMIN_USER_ID,
-                document=video,
-                filename=output.name,
-            )
-
-    else:
-        await bot.send_message(
-            chat_id=ADMIN_USER_ID,
-            text=(
-                "⚠️ التسجيل أكبر من 49MB، "
-                "لذلك لم يتم إرساله في هذه المرحلة."
-            ),
-        )
-
-
-async def main():
-    if len(sys.argv) < 2:
-        print(
-            "Usage: python record_once.py "
-            "https://example.com/stream/123"
-        )
-        sys.exit(1)
-
-    page_url = sys.argv[1].strip()
-
-    if not re.match(
-        r"^https?://",
-        page_url,
-        re.I,
-    ):
-        print("Invalid URL.")
-        sys.exit(1)
-
-    print("Searching for HLS playlist...")
-
-    m3u8_url, headers = await find_m3u8(
-        page_url
-    )
-
-    if not m3u8_url:
-        print(
-            "ERROR: No m3u8 playlist was found."
-        )
-        sys.exit(1)
-
-    print("HLS playlist found:")
-    print(m3u8_url)
-
-    output = WORK_DIR / "recording.mp4"
-
-    command = build_ffmpeg_command(
-        m3u8_url,
-        headers or {},
-        output,
-    )
-
-    print("Starting FFmpeg recording...")
-
-    process = await asyncio.create_subprocess_exec(
-        *command
-    )
+    sent_files = set()
 
     try:
-        await process.wait()
+        while process.poll() is None:
+
+            for file in sorted(OUTPUT_DIR.glob("part_*.mp4")):
+
+                if file.name in sent_files:
+                    continue
+
+                # نتأكد أن FFmpeg انتهى من كتابة الملف
+                size1 = file.stat().st_size
+                await asyncio.sleep(2)
+
+                if not file.exists():
+                    continue
+
+                size2 = file.stat().st_size
+
+                if size1 != size2:
+                    continue
+
+                size_mb = size2 / (1024 * 1024)
+
+                if size_mb > 49:
+                    print(
+                        f"Skipping {file.name}: "
+                        f"{size_mb:.1f} MB"
+                    )
+                    continue
+
+                print(
+                    f"Sending {file.name} "
+                    f"({size_mb:.1f} MB)"
+                )
+
+                try:
+                    with open(file, "rb") as video:
+                        await bot.send_document(
+                            chat_id=CHAT_ID,
+                            document=video,
+                            caption=f"🎥 جزء من التسجيل: {file.name}"
+                        )
+
+                    sent_files.add(file.name)
+
+                    file.unlink(missing_ok=True)
+
+                except Exception as e:
+                    print(
+                        "Telegram upload error:",
+                        e
+                    )
+
+            await asyncio.sleep(5)
 
     except KeyboardInterrupt:
-        process.send_signal(
-            subprocess.signal.SIGINT
-        )
-        await process.wait()
+        process.terminate()
 
-    print(
-        f"FFmpeg finished with code "
-        f"{process.returncode}"
+    finally:
+        if process.poll() is None:
+            process.terminate()
+
+        process.wait()
+
+    # إرسال أي جزء أخير
+    for file in sorted(OUTPUT_DIR.glob("part_*.mp4")):
+
+        if file.name in sent_files:
+            continue
+
+        size_mb = file.stat().st_size / (1024 * 1024)
+
+        if size_mb > 49:
+            continue
+
+        try:
+            with open(file, "rb") as video:
+                await bot.send_document(
+                    chat_id=CHAT_ID,
+                    document=video,
+                    caption=f"🎥 جزء من التسجيل: {file.name}"
+                )
+
+            file.unlink(missing_ok=True)
+
+        except Exception as e:
+            print("Final upload error:", e)
+
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text="✅ انتهى التسجيل."
     )
-
-    if output.exists() and output.stat().st_size > 0:
-        await send_file(output)
-
-    else:
-        print("No recording file was created.")
 
 
 if __name__ == "__main__":
