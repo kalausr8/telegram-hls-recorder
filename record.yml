@@ -1,0 +1,33 @@
+name: HLS Recorder
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Stream page URL"
+        required: true
+        type: string
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          pip install playwright aiohttp python-telegram-bot
+          playwright install chromium
+
+      - name: Start recorder
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          STREAM_URL: ${{ inputs.url }}
+        run: |
+          python bot.py "$STREAM_URL"
