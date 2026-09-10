@@ -1,5 +1,7 @@
 name: HLS Recorder
 
+run-name: TGREC-${{ github.event.client_payload.record_id }}
+
 on:
   repository_dispatch:
     types: [telegram_record]
