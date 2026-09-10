@@ -774,12 +774,11 @@ async def main():
                 PAGE_URL
             )
 
-            playlist_url, playlist =
-                await find_live_playlist(
-                    session,
-                    discovered,
-                    headers
-                )
+            playlist_url, playlist = await find_live_playlist(
+                session,
+                discovered,
+                headers
+            )
 
             if not playlist_url:
                 await send_message(
@@ -803,12 +802,11 @@ async def main():
 
             while not stop_requested:
 
-                status, manifest, _ =
-                    await fetch_text(
-                        session,
-                        playlist_url,
-                        headers
-                    )
+                status, manifest, _ = await fetch_text(
+                    session,
+                    playlist_url,
+                    headers
+                )
 
                 if status == 401:
                     log(
@@ -820,12 +818,11 @@ async def main():
                         page
                     )
 
-                    new_url, new_manifest =
-                        await find_live_playlist(
-                            session,
-                            discovered,
-                            headers
-                        )
+                    new_url, new_manifest = await find_live_playlist(
+                        session,
+                        discovered,
+                        headers
+                    )
 
                     if new_url:
                         playlist_url = new_url
@@ -833,8 +830,7 @@ async def main():
                         status = 200
 
                 if status != 200 or not manifest:
-                    elapsed =
-                        time.monotonic() - last_success
+                    elapsed = time.monotonic() - last_success
 
                     log(
                         f"[HLS] Manifest unavailable. "
@@ -859,11 +855,10 @@ async def main():
 
                 last_success = time.monotonic()
 
-                parsed =
-                    parse_playlist(
-                        manifest,
-                        playlist_url
-                    )
+                parsed = parse_playlist(
+                    manifest,
+                    playlist_url
+                )
 
                 # -------------------------------------------------
                 # Download new segments
@@ -881,16 +876,14 @@ async def main():
                         len(segment_paths) + 1
                     )
 
-                    output_path =
-                        safe_filename(index)
+                    output_path = safe_filename(index)
 
-                    success =
-                        await download_segment(
-                            session,
-                            segment_url,
-                            output_path,
-                            headers
-                        )
+                    success = await download_segment(
+                        session,
+                        segment_url,
+                        output_path,
+                        headers
+                    )
 
                     if not success:
                         continue
@@ -1003,10 +996,9 @@ async def main():
                 f"{len(segment_paths)} segments..."
             )
 
-            success =
-                build_full_video(
-                    segment_paths
-                )
+            success = build_full_video(
+                segment_paths
+            )
 
             if not success:
                 try:
@@ -1023,15 +1015,13 @@ async def main():
             # Send complete video
             # -------------------------------------------------
 
-            sent =
-                await send_video(
-                    session,
-                    FULL_VIDEO
-                )
+            sent = await send_video(
+                session,
+                FULL_VIDEO
+            )
 
             if sent:
-                minutes =
-                    total_duration / 60
+                minutes = total_duration / 60
 
                 await send_message(
                     session,
