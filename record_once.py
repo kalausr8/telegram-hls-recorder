@@ -113,13 +113,11 @@ def parse_hls(text, base_url):
             height = None
 
             if "x" in resolution:
-
                 try:
                     width, height = map(
                         int,
                         resolution.split("x", 1)
                     )
-
                 except Exception:
                     pass
 
@@ -154,7 +152,6 @@ def parse_hls(text, base_url):
     segments = []
 
     init_map = None
-
     target_duration = 6
 
     pending_duration = 0
@@ -165,12 +162,10 @@ def parse_hls(text, base_url):
         if line.startswith(
             "#EXT-X-TARGETDURATION"
         ):
-
             try:
                 target_duration = int(
                     line.split(":", 1)[1]
                 )
-
             except Exception:
                 pass
 
@@ -186,7 +181,6 @@ def parse_hls(text, base_url):
             ).strip('"')
 
             if uri:
-
                 init_map = {
                     "url": urljoin(
                         base_url,
@@ -205,13 +199,10 @@ def parse_hls(text, base_url):
             )[1]
 
             try:
-
                 pending_duration = float(
                     value.split(",", 1)[0]
                 )
-
             except Exception:
-
                 pending_duration = 0
 
         elif line.startswith(
@@ -254,7 +245,6 @@ def range_header(value):
         return None
 
     try:
-
         parts = value.split("@")
 
         length = int(parts[0])
@@ -270,7 +260,6 @@ def range_header(value):
         )
 
     except Exception:
-
         return None
 
 
@@ -309,7 +298,6 @@ async def download_bytes(
                 ):
 
                     if response.status == 401:
-
                         raise PermissionError(
                             "HTTP 401"
                         )
@@ -333,14 +321,12 @@ async def download_bytes(
             )
 
             if attempt + 1 < SEGMENT_RETRIES:
-
                 await asyncio.sleep(1)
 
     if isinstance(
         last_error,
         PermissionError
     ):
-
         return None, 401
 
     return None, None
@@ -362,14 +348,15 @@ async def fetch_playlist(
         ) as response:
 
             if response.status == 401:
-
                 return None, 401
 
             if response.status != 200:
 
-                raise RuntimeError(
+                print(
                     f"Playlist HTTP {response.status}"
                 )
+
+                return None, response.status
 
             text = await response.text()
 
@@ -412,7 +399,6 @@ async def build_headers(
     }
 
     if cookie_header:
-
         headers["Cookie"] = cookie_header
 
     return headers
@@ -461,11 +447,8 @@ async def discover_and_refresh(
         ]
 
         if live_urls:
-
             new_manifest = live_urls[-1]
-
         else:
-
             new_manifest = discovered[-1]
 
         if new_manifest != current_manifest:
@@ -566,11 +549,8 @@ async def discover_hls():
     ]
 
     if live_urls:
-
         manifest_url = live_urls[-1]
-
     else:
-
         manifest_url = discovered[-1]
 
     headers = await build_headers(
@@ -976,4 +956,502 @@ async def main():
                                     page,
                                     PAGE_URL
                                 )
-                          
+                            )
+
+                            consecutive_401 = 0
+
+                        await asyncio.sleep(1)
+
+                        continue
+
+                    if (
+                        status != 200
+                        or not playlist_text
+                    ):
+
+                        print(
+                            "Playlist temporarily "
+                            "unavailable."
+                        )
+
+                        await asyncio.sleep(2)
+
+                        continue
+
+                    consecutive_401 = 0
+
+                    parsed = parse_hls(
+                        playlist_text,
+                        manifest_url
+                    )
+
+                    # -------------------------------------
+                    # إذا عاد Master Playlist
+                    # -------------------------------------
+
+                    if parsed["type"] != "media":
+
+                        variants = parsed.get(
+                            "variants",
+                            []
+                        )
+
+                        if variants:
+
+                            selected = variants[0]
+
+                            manifest_url = (
+                                selected["url"]
+                            )
+
+                            print(
+                                "Switched to media "
+                                "variant:",
+                                manifest_url
+                            )
+
+                        await asyncio.sleep(1)
+
+                        continue
+
+                    # =====================================
+                    # EXT-X-MAP لـ fMP4
+                    # =====================================
+
+                    if (
+                        parsed["init"]
+                        and not init_downloaded
+                    ):
+
+                        init_data, init_status = (
+                            await download_bytes(
+                                session,
+                                parsed["init"]["url"],
+                                headers,
+                                parsed["init"].get(
+                                    "range"
+                                )
+                            )
+                        )
+
+                        if init_status == 401:
+
+                            print(
+                                "Init segment returned 401."
+                            )
+
+                            consecutive_401 += 1
+
+                            if (
+                                consecutive_401
+                                >= MAX_401_BEFORE_RELOAD
+                            ):
+
+                                manifest_url = (
+                                    await discover_and_refresh(
+                                        page,
+                                        discovered,
+                                        manifest_url
+                                    )
+                                )
+
+                                headers = (
+                                    await build_headers(
+                                        page,
+                                        PAGE_URL
+                                    )
+                                )
+
+                                consecutive_401 = 0
+
+                            await asyncio.sleep(1)
+
+                            continue
+
+                        if init_data:
+
+                            init_file = (
+                                SEGMENT_DIR
+                                / "init.mp4"
+                            )
+
+                            init_file.write_bytes(
+                                init_data
+                            )
+
+                            init_downloaded = True
+
+                            print(
+                                "HLS init segment saved:",
+                                len(init_data),
+                                "bytes"
+                            )
+
+                    # =====================================
+                    # اكتشاف segments الجديدة
+                    # =====================================
+
+                    new_segments = []
+
+                    for segment in parsed["segments"]:
+
+                        segment_url = segment["url"]
+
+                        if (
+                            segment_url
+                            in known_segments
+                        ):
+                            continue
+
+                        new_segments.append(
+                            segment
+                        )
+
+                    # =====================================
+                    # تحميل segments
+                    # =====================================
+
+                    segment_401 = False
+
+                    for segment in new_segments:
+
+                        data, download_status = (
+                            await download_bytes(
+                                session,
+                                segment["url"],
+                                headers,
+                                segment.get("range")
+                            )
+                        )
+
+                        if download_status == 401:
+
+                            print(
+                                "Segment returned 401."
+                            )
+
+                            segment_401 = True
+
+                            break
+
+                        if not data:
+
+                            print(
+                                "Skipping failed segment:",
+                                segment["url"]
+                            )
+
+                            continue
+
+                        # نضيفه إلى known فقط بعد نجاح التحميل
+                        known_segments.add(
+                            segment["url"]
+                        )
+
+                        segment_index = (
+                            total_segments
+                        )
+
+                        segment_file = (
+                            SEGMENT_DIR
+                            / f"{segment_index:08d}.seg"
+                        )
+
+                        segment_file.write_bytes(
+                            data
+                        )
+
+                        current_files.append(
+                            segment_file
+                        )
+
+                        duration = (
+                            segment.get(
+                                "duration",
+                                0
+                            )
+                            or 0
+                        )
+
+                        current_duration += duration
+                        total_duration += duration
+                        total_segments += 1
+
+                        print(
+                            f"Segment "
+                            f"{total_segments} "
+                            f"+{duration:.2f}s "
+                            f"total="
+                            f"{total_duration:.1f}s"
+                        )
+
+                    # -------------------------------------
+                    # إذا حصل 401 أثناء segment
+                    # -------------------------------------
+
+                    if segment_401:
+
+                        consecutive_401 += 1
+
+                        print(
+                            f"Segment authentication "
+                            f"problem ({consecutive_401})"
+                        )
+
+                        if (
+                            consecutive_401
+                            >= MAX_401_BEFORE_RELOAD
+                        ):
+
+                            manifest_url = (
+                                await discover_and_refresh(
+                                    page,
+                                    discovered,
+                                    manifest_url
+                                )
+                            )
+
+                            headers = (
+                                await build_headers(
+                                    page,
+                                    PAGE_URL
+                                )
+                            )
+
+                            consecutive_401 = 0
+
+                        await asyncio.sleep(1)
+
+                        continue
+
+                    last_successful_poll = (
+                        time.time()
+                    )
+
+                    # =====================================
+                    # إنشاء Chunk عند 60 ثانية
+                    # =====================================
+
+                    if (
+                        current_duration
+                        >= TARGET_CHUNK_SECONDS
+                        and current_files
+                    ):
+
+                        chunk_number += 1
+
+                        chunk_file = (
+                            CHUNK_DIR
+                            / f"part_{chunk_number:04d}.mp4"
+                        )
+
+                        mux_files = list(
+                            current_files
+                        )
+
+                        if init_file:
+
+                            mux_files = [
+                                init_file,
+                                *mux_files
+                            ]
+
+                        try:
+
+                            await mux_chunk(
+                                mux_files,
+                                chunk_file
+                            )
+
+                            sent = await send_chunk(
+                                bot,
+                                chunk_file,
+                                chunk_number
+                            )
+
+                            if sent:
+
+                                chunk_file.unlink(
+                                    missing_ok=True
+                                )
+
+                                for file in current_files:
+
+                                    file.unlink(
+                                        missing_ok=True
+                                    )
+
+                                current_files.clear()
+
+                                current_duration = 0
+
+                        except Exception as error:
+
+                            print(
+                                "Chunk error:",
+                                error
+                            )
+
+                            # لا نحذف segments
+                            # عند فشل الـmux
+
+                    # =====================================
+                    # VOD انتهى فعليًا
+                    # =====================================
+
+                    if not parsed["live"]:
+
+                        print(
+                            "HLS playlist has ENDLIST."
+                        )
+
+                        break
+
+                    target = max(
+                        1,
+                        parsed.get(
+                            "target_duration",
+                            2
+                        ) / 2
+                    )
+
+                    await asyncio.sleep(
+                        min(
+                            POLL_SECONDS,
+                            target
+                        )
+                    )
+
+                except Exception as error:
+
+                    print(
+                        "Polling error:",
+                        error
+                    )
+
+                    await asyncio.sleep(3)
+
+                # =========================================
+                # إذا انقطع المصدر أكثر من 5 دقائق
+                # =========================================
+
+                if (
+                    time.time()
+                    - last_successful_poll
+                    > SOURCE_TIMEOUT_SECONDS
+                ):
+
+                    raise RuntimeError(
+                        "HLS source unavailable "
+                        "for more than 5 minutes"
+                    )
+
+        finally:
+
+            # =============================================
+            # إرسال الجزء الأخير
+            # =============================================
+
+            if current_files:
+
+                chunk_number += 1
+
+                final_file = (
+                    CHUNK_DIR
+                    / f"part_{chunk_number:04d}.mp4"
+                )
+
+                mux_files = list(
+                    current_files
+                )
+
+                if init_file:
+
+                    mux_files = [
+                        init_file,
+                        *mux_files
+                    ]
+
+                try:
+
+                    await mux_chunk(
+                        mux_files,
+                        final_file
+                    )
+
+                    sent = await send_chunk(
+                        bot,
+                        final_file,
+                        chunk_number
+                    )
+
+                    if sent:
+
+                        final_file.unlink(
+                            missing_ok=True
+                        )
+
+                except Exception as error:
+
+                    print(
+                        "Final chunk error:",
+                        error
+                    )
+
+            # =============================================
+            # رسالة النهاية
+            # =============================================
+
+            try:
+
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        "✅ انتهى التسجيل.\n"
+                        f"⏱ المدة التقريبية: "
+                        f"{total_duration / 60:.1f} دقيقة\n"
+                        f"📦 الأجزاء: "
+                        f"{chunk_number}"
+                    )
+                )
+
+            except Exception as error:
+
+                print(
+                    "Telegram final message error:",
+                    error
+                )
+
+            # =============================================
+            # إغلاق Playwright
+            # =============================================
+
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+            try:
+                await playwright.stop()
+            except Exception:
+                pass
+
+    print(
+        "Recorder finished."
+    )
+
+
+if __name__ == "__main__":
+
+    try:
+
+        asyncio.run(main())
+
+    except Exception as error:
+
+        print(
+            "FATAL ERROR:",
+            error
+        )
+
+        raise
