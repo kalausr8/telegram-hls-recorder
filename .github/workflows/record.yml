@@ -39,5 +39,11 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_OWNER: kalausr8
+          GITHUB_REPO: telegram-hls-recorder
+          RECORD_ID: ${{ github.event.client_payload.record_id }}
+
         run: |
           python record_once.py "${{ github.event.client_payload.url }}"
