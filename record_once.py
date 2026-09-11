@@ -8,7 +8,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -975,6 +975,8 @@ async def record_hls(
     initial_playlist,
     headers,
 ):
+    global stop_requested
+    
     log(
         "[RECORDER] Starting HLS "
         "recording..."
@@ -1012,7 +1014,7 @@ async def record_hls(
     consecutive_segment_errors = 0
     last_status_update = 0
     recording_start_time = time.time()
-    start_time_iso = datetime.utcnow().isoformat()
+    start_time_iso = datetime.now(timezone.utc).isoformat()
 
     await github_update_file(
         f".recorder/active/{RECORD_ID}.json",
@@ -2113,7 +2115,7 @@ async def main():
 
     discovered = []
     segment_files = []
-    start_time_iso = datetime.utcnow().isoformat()
+    start_time_iso = datetime.now(timezone.utc).isoformat()
     recording_start_time = time.time()
 
     async with async_playwright() as playwright:
@@ -2354,7 +2356,7 @@ async def main():
             "record_id": RECORD_ID,
             "url": PAGE_URL,
             "started_at": start_time_iso,
-            "ended_at": datetime.utcnow().isoformat(),
+            "ended_at": datetime.now(timezone.utc).isoformat(),
             "duration_seconds": duration,
             "size_mb": round(full_size_mb, 2),
             "parts_count": parts_count,
