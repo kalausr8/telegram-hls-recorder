@@ -3,16 +3,17 @@ import base64
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from playwright.async_api import async_playwright
-
 
 # ============================================================
 # Configuration
@@ -20,8 +21,8 @@ from playwright.async_api import async_playwright
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
-
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
 GITHUB_OWNER = os.environ.get(
     "GITHUB_OWNER",
     "kalausr8",
@@ -30,7 +31,6 @@ GITHUB_REPO = os.environ.get(
     "GITHUB_REPO",
     "telegram-hls-recorder",
 )
-
 RECORD_ID = os.environ.get(
     "RECORD_ID",
     "UNKNOWN",
@@ -42,13 +42,8 @@ PAGE_URL = (
     else ""
 )
 
-# Telegram Bot API upload safety limit.
-# We stay comfortably below 50 MB.
 TELEGRAM_MAX_MB = 49
-
-# Target size for each generated MP4 part.
 PART_TARGET_MB = 47
-
 PART_TARGET_BYTES = (
     PART_TARGET_MB
     * 1024
@@ -58,9 +53,12 @@ PART_TARGET_BYTES = (
 DISCOVERY_TIMEOUT = 30
 PLAYLIST_TIMEOUT = 20
 SEGMENT_TIMEOUT = 30
-
 STOP_CHECK_INTERVAL = 2.0
 PLAYLIST_POLL_INTERVAL = 2.0
+
+MAX_PLAYLIST_RETRIES = 5
+MAX_SEGMENT_RETRIES = 3
+STATUS_UPDATE_INTERVAL = 60
 
 STOP_FILE = (
     f".recorder/stop/{RECORD_ID}"
@@ -73,7 +71,6 @@ PARTS_DIR = OUTPUT_DIR / "parts"
 
 stop_requested = False
 
-
 # ============================================================
 # Logging
 # ============================================================
@@ -84,33 +81,27 @@ def log(message):
         flush=True,
     )
 
-
 # ============================================================
 # Signal handling
 # ============================================================
 
 def request_stop(signum, frame):
     global stop_requested
-
     if not stop_requested:
         stop_requested = True
-
         log(
             f"[STOP] Received signal {signum}. "
             "Stopping recording safely..."
         )
 
-
 signal.signal(
     signal.SIGTERM,
     request_stop,
 )
-
 signal.signal(
     signal.SIGINT,
     request_stop,
 )
-
 
 # ============================================================
 # Telegram
@@ -143,19 +134,15 @@ async def telegram_request(
         async with aiohttp.ClientSession(
             timeout=timeout
         ) as session:
-
             if file_data is not None:
                 form = aiohttp.FormData()
-
                 for key, value in (
                     data or {}
                 ).items():
-
                     form.add_field(
                         key,
                         str(value),
                     )
-
                 form.add_field(
                     "video",
                     file_data,
@@ -165,25 +152,20 @@ async def telegram_request(
                     ),
                     content_type="video/mp4",
                 )
-
                 async with session.post(
                     url,
                     data=form,
                 ) as response:
-
                     text = await response.text()
-
                     log(
                         f"[TELEGRAM] {method}: "
                         f"HTTP {response.status}"
                     )
-
                     if response.status != 200:
                         log(
                             f"[TELEGRAM] Response: "
                             f"{text[:3000]}"
                         )
-
                     return (
                         response.status,
                         text,
@@ -193,20 +175,16 @@ async def telegram_request(
                 url,
                 json=data or {},
             ) as response:
-
                 text = await response.text()
-
                 log(
                     f"[TELEGRAM] {method}: "
                     f"HTTP {response.status}"
                 )
-
                 if response.status != 200:
                     log(
                         f"[TELEGRAM] Response: "
                         f"{text[:3000]}"
                     )
-
                 return (
                     response.status,
                     text,
@@ -232,33 +210,94 @@ async def send_message(text):
         },
     )
 
+# ============================================================
+# GitHub State Management
+# ============================================================
+
+async def github_update_file(path, content_dict, message):
+    if not GITHUB_TOKEN:
+        return
+    url = (
+        f"https://api.github.com/repos/"
+        f"{GITHUB_OWNER}/"
+        f"{GITHUB_REPO}/"
+        f"contents/{path}"
+    )
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "telegram-hls-recorder",
+    }
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            sha = None
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    sha = data.get("sha")
+            
+            encoded = base64.b64encode(
+                json.dumps(content_dict, indent=2).encode("utf-8")
+            ).decode("utf-8")
+            
+            body = {"message": message, "content": encoded}
+            if sha:
+                body["sha"] = sha
+                
+            async with session.put(url, headers=headers, json=body) as resp:
+                if resp.status not in (200, 201):
+                    text = await resp.text()
+                    log(f"[GITHUB] Update failed for {path}: HTTP {resp.status} - {text[:500]}")
+                else:
+                    log(f"[GITHUB] Updated {path}")
+    except Exception as exc:
+        log(f"[GITHUB] Exception updating {path}: {exc}")
+
+async def github_delete_file(path, message):
+    if not GITHUB_TOKEN:
+        return
+    url = (
+        f"https://api.github.com/repos/"
+        f"{GITHUB_OWNER}/"
+        f"{GITHUB_REPO}/"
+        f"contents/{path}"
+    )
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "telegram-hls-recorder",
+    }
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            sha = None
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    sha = data.get("sha")
+            
+            if not sha:
+                return
+                
+            body = {"message": message, "sha": sha}
+            async with session.delete(url, headers=headers, json=body) as resp:
+                if resp.status not in (200, 204):
+                    log(f"[GITHUB] Delete failed for {path}: HTTP {resp.status}")
+                else:
+                    log(f"[GITHUB] Deleted {path}")
+    except Exception as exc:
+        log(f"[GITHUB] Exception deleting {path}: {exc}")
 
 # ============================================================
 # GitHub stop signal
 # ============================================================
 
 async def github_stop_requested():
-    """
-    Checks:
-
-        .recorder/stop/{RECORD_ID}
-
-    Accepted stop-file formats:
-
-    1. JSON:
-       {
-         "record_id": "ABC123",
-         "stop": true
-       }
-
-    2. Tolerant plain text.
-
-    3. Any non-empty record-specific stop file.
-    """
-
     if not GITHUB_TOKEN:
         return False
-
     if not RECORD_ID:
         return False
 
@@ -293,15 +332,12 @@ async def github_stop_requested():
         async with aiohttp.ClientSession(
             timeout=timeout
         ) as session:
-
             async with session.get(
                 url,
                 headers=headers,
             ) as response:
-
                 if response.status == 404:
                     return False
-
                 if response.status != 200:
                     log(
                         "[STOP] GitHub stop check "
@@ -310,7 +346,6 @@ async def github_stop_requested():
                     return False
 
                 data = await response.json()
-
                 encoded = data.get(
                     "content"
                 )
@@ -337,15 +372,10 @@ async def github_stop_requested():
 
                 raw_stripped = raw.strip()
 
-                # ------------------------------------------------
-                # JSON
-                # ------------------------------------------------
-
                 try:
                     obj = json.loads(
                         raw_stripped
                     )
-
                     record_matches = (
                         str(
                             obj.get(
@@ -355,7 +385,6 @@ async def github_stop_requested():
                         )
                         == str(RECORD_ID)
                     )
-
                     stop_value = obj.get(
                         "stop"
                     )
@@ -373,17 +402,11 @@ async def github_stop_requested():
                 except Exception:
                     pass
 
-                # ------------------------------------------------
-                # Plain text
-                # ------------------------------------------------
-
                 lower = raw_stripped.lower()
-
                 record_matches = (
                     str(RECORD_ID).lower()
                     in lower
                 )
-
                 stop_matches = (
                     "stop" in lower
                     or "true" in lower
@@ -400,10 +423,6 @@ async def github_stop_requested():
                     )
                     return True
 
-                # ------------------------------------------------
-                # Existing non-empty record-specific file
-                # ------------------------------------------------
-
                 if raw_stripped:
                     log(
                         "[STOP] Stop file exists for "
@@ -414,7 +433,6 @@ async def github_stop_requested():
 
     except asyncio.CancelledError:
         raise
-
     except Exception as exc:
         log(
             "[STOP] GitHub check failed: "
@@ -432,16 +450,13 @@ async def check_stop():
 
     if await github_stop_requested():
         stop_requested = True
-
         log(
             "[STOP] Cooperative stop signal "
             "detected."
         )
-
         return True
 
     return False
-
 
 # ============================================================
 # Helpers
@@ -450,14 +465,12 @@ async def check_stop():
 def normalize_url(url):
     if not url:
         return None
-
     return url.strip()
 
 
 def is_m3u8(url):
     if not url:
         return False
-
     return (
         ".m3u8"
         in url.lower()
@@ -470,13 +483,11 @@ def safe_filename(value):
         "_",
         value,
     )
-
     return value[:180]
 
 
 def origin_from_url(url):
     parsed = urlparse(url)
-
     if (
         not parsed.scheme
         or not parsed.netloc
@@ -487,7 +498,6 @@ def origin_from_url(url):
         f"{parsed.scheme}://"
         f"{parsed.netloc}"
     )
-
 
 # ============================================================
 # Browser session headers
@@ -500,7 +510,6 @@ async def build_browser_session(
     user_agent = await page.evaluate(
         "() => navigator.userAgent"
     )
-
     cookies = await context.cookies()
 
     cookie_header = "; ".join(
@@ -536,7 +545,6 @@ async def build_browser_session(
 
     return headers
 
-
 # ============================================================
 # HLS discovery
 # ============================================================
@@ -545,13 +553,8 @@ async def inspect_page_for_hls(
     page,
     discovered,
 ):
-    # --------------------------------------------------------
-    # HTML
-    # --------------------------------------------------------
-
     try:
         html = await page.content()
-
         found = re.findall(
             r'https?://[^"\']+?\.m3u8[^"\']*',
             html,
@@ -559,18 +562,15 @@ async def inspect_page_for_hls(
         )
 
         for url in found:
-
             url = url.replace(
                 "&amp;",
                 "&",
             )
 
             if url not in discovered:
-
                 discovered.append(
                     url
                 )
-
                 log(
                     "[HLS] Discovered "
                     "from HTML: "
@@ -582,10 +582,6 @@ async def inspect_page_for_hls(
             "[HLS] HTML inspection "
             f"failed: {exc}"
         )
-
-    # --------------------------------------------------------
-    # Performance API
-    # --------------------------------------------------------
 
     try:
         performance_urls = (
@@ -602,13 +598,10 @@ async def inspect_page_for_hls(
         )
 
         for url in performance_urls:
-
             if url not in discovered:
-
                 discovered.append(
                     url
                 )
-
                 log(
                     "[HLS] Discovered "
                     "from performance: "
@@ -620,7 +613,6 @@ async def inspect_page_for_hls(
             "[HLS] Performance inspection "
             f"failed: {exc}"
         )
-
 
 # ============================================================
 # Playlist parsing
@@ -645,23 +637,15 @@ def parse_playlist(
 
     variants = []
     segments = []
-
     is_master = False
 
     for index, line in enumerate(
         lines
     ):
-
-        # ----------------------------------------------------
-        # Master playlist
-        # ----------------------------------------------------
-
         if line.startswith(
             "#EXT-X-STREAM-INF"
         ):
-
             is_master = True
-
             bandwidth = 0
             resolution = ""
 
@@ -691,7 +675,6 @@ def parse_playlist(
                 index + 1
                 < len(lines)
             ):
-
                 next_line = (
                     lines[index + 1]
                 )
@@ -699,7 +682,6 @@ def parse_playlist(
                 if not next_line.startswith(
                     "#"
                 ):
-
                     variant_url = urljoin(
                         playlist_url,
                         next_line,
@@ -713,19 +695,13 @@ def parse_playlist(
                         }
                     )
 
-        # ----------------------------------------------------
-        # Media playlist
-        # ----------------------------------------------------
-
         elif line.startswith(
             "#EXTINF:"
         ):
-
             if (
                 index + 1
                 < len(lines)
             ):
-
                 segment_url = (
                     lines[index + 1]
                 )
@@ -733,7 +709,6 @@ def parse_playlist(
                 if not segment_url.startswith(
                     "#"
                 ):
-
                     segments.append(
                         urljoin(
                             playlist_url,
@@ -753,7 +728,6 @@ def parse_playlist(
         "variants": [],
         "segments": segments,
     }
-
 
 # ============================================================
 # Browser HLS request
@@ -813,9 +787,7 @@ async def browser_get_playlist(
             "[PLAYLIST] Browser request "
             f"failed: {exc}"
         )
-
         return None, None
-
 
 # ============================================================
 # Find live media playlist
@@ -826,13 +798,11 @@ async def find_live_playlist(
     discovered,
 ):
     checked = set()
-
     candidates = list(
         discovered
     )
 
     for url in candidates:
-
         if await check_stop():
             return None, None
 
@@ -856,34 +826,23 @@ async def find_live_playlist(
             url,
         )
 
-        # ----------------------------------------------------
-        # Direct media playlist
-        # ----------------------------------------------------
-
         if (
             parsed["type"] == "media"
             and parsed["segments"]
         ):
-
             log(
                 "[HLS] Usable media "
                 "playlist found: "
                 f"{url}"
             )
-
             return (
                 url,
                 parsed,
             )
 
-        # ----------------------------------------------------
-        # Master playlist
-        # ----------------------------------------------------
-
         if (
             parsed["type"] == "master"
         ):
-
             variants = parsed[
                 "variants"
             ]
@@ -903,7 +862,6 @@ async def find_live_playlist(
             )
 
             for variant in variants:
-
                 if await check_stop():
                     return None, None
 
@@ -951,7 +909,6 @@ async def find_live_playlist(
                         "segments"
                     ]
                 ):
-
                     log(
                         "[HLS] Usable variant "
                         "found: "
@@ -965,7 +922,6 @@ async def find_live_playlist(
 
     return None, None
 
-
 # ============================================================
 # Segment downloader
 # ============================================================
@@ -977,50 +933,36 @@ async def download_segment(
     headers,
 ):
     try:
-
         timeout = aiohttp.ClientTimeout(
             total=SEGMENT_TIMEOUT
         )
-
         async with session.get(
             url,
             headers=headers,
             timeout=timeout,
         ) as response:
-
             if response.status != 200:
-
                 log(
                     "[SEGMENT] HTTP "
                     f"{response.status}: "
                     f"{url}"
                 )
-
-                return False
-
+                return False, response.status
             data = await response.read()
-
             if not data:
-                return False
-
+                return False, response.status
             path.write_bytes(
                 data
             )
-
-            return True
-
+            return True, 200
     except asyncio.CancelledError:
         raise
-
     except Exception as exc:
-
         log(
             "[SEGMENT] Download failed: "
             f"{exc}"
         )
-
-        return False
-
+        return False, None
 
 # ============================================================
 # Recording loop
@@ -1061,37 +1003,70 @@ async def record_hls(
     timeout = aiohttp.ClientTimeout(
         total=SEGMENT_TIMEOUT
     )
-
     connector = aiohttp.TCPConnector(
         limit=10,
         ssl=False,
+    )
+    
+    consecutive_playlist_errors = 0
+    consecutive_segment_errors = 0
+    last_status_update = 0
+    recording_start_time = time.time()
+    start_time_iso = datetime.utcnow().isoformat()
+
+    await github_update_file(
+        f".recorder/active/{RECORD_ID}.json",
+        {
+            "record_id": RECORD_ID,
+            "url": PAGE_URL,
+            "started_at": start_time_iso
+        },
+        f"Start recording {RECORD_ID}"
     )
 
     async with aiohttp.ClientSession(
         timeout=timeout,
         connector=connector,
     ) as session:
-
         while not stop_requested:
-
             if await check_stop():
                 break
+                
+            if time.time() - last_status_update > STATUS_UPDATE_INTERVAL:
+                last_status_update = time.time()
+                duration = int(time.time() - recording_start_time)
+                size_bytes = sum(p.stat().st_size for p in segment_files if p.exists())
+                size_mb = size_bytes / 1024 / 1024
+                await github_update_file(
+                    f".recorder/status/{RECORD_ID}.json",
+                    {
+                        "record_id": RECORD_ID,
+                        "url": PAGE_URL,
+                        "duration_seconds": duration,
+                        "segments_count": len(segment_files),
+                        "size_mb": round(size_mb, 2),
+                        "hls_status": "recording"
+                    },
+                    f"Update status {RECORD_ID}"
+                )
+                try:
+                    video_missing = await page.evaluate("() => !document.querySelector('video')")
+                    if video_missing:
+                        log("[RECORDER] Video element missing from page. Possible end/premium.")
+                except Exception:
+                    pass
 
             try:
-
                 current_headers = (
                     await build_browser_session(
                         page,
                         context,
                     )
                 )
-
                 headers.update(
                     current_headers
                 )
-
             except Exception as exc:
-
                 log(
                     "[SESSION] Could not "
                     "refresh headers: "
@@ -1106,36 +1081,38 @@ async def record_hls(
             )
 
             if not playlist_text:
-
+                consecutive_playlist_errors += 1
                 log(
-                    "[RECORDER] Playlist "
-                    "request failed; retrying..."
+                    f"[RECORDER] Playlist "
+                    f"request failed ({consecutive_playlist_errors}/{MAX_PLAYLIST_RETRIES})..."
                 )
-
+                if consecutive_playlist_errors >= MAX_PLAYLIST_RETRIES:
+                    log("[RECORDER] Max playlist retries reached. Stopping.")
+                    await send_message(
+                        f"⚠️ التسجيل #{RECORD_ID} توقف.\n\n"
+                        "السبب:\n"
+                        "انتهت محاولات إعادة الاتصال بـ HLS."
+                    )
+                    break
                 await asyncio.sleep(
                     PLAYLIST_POLL_INTERVAL
                 )
-
                 continue
+
+            consecutive_playlist_errors = 0
 
             parsed = parse_playlist(
                 playlist_text,
                 playlist_url,
             )
 
-            # ------------------------------------------------
-            # If master playlist appears again
-            # ------------------------------------------------
-
             if (
                 parsed["type"]
                 == "master"
             ):
-
                 variants = parsed[
                     "variants"
                 ]
-
                 variants.sort(
                     key=lambda x: x.get(
                         "bandwidth",
@@ -1143,31 +1120,24 @@ async def record_hls(
                     ),
                     reverse=True,
                 )
-
                 switched = False
-
                 for variant in variants:
-
                     if await check_stop():
                         break
-
                     variant_text, _ = (
                         await browser_get_playlist(
                             context,
                             variant["url"],
                         )
                     )
-
                     if not variant_text:
                         continue
-
                     variant_parsed = (
                         parse_playlist(
                             variant_text,
                             variant["url"],
                         )
                     )
-
                     if (
                         variant_parsed[
                             "type"
@@ -1176,105 +1146,103 @@ async def record_hls(
                             "segments"
                         ]
                     ):
-
                         playlist_url = (
                             variant["url"]
                         )
-
                         parsed = (
                             variant_parsed
                         )
-
                         switched = True
-
                         break
-
                 if stop_requested:
                     break
-
                 if not switched:
-
                     await asyncio.sleep(
                         PLAYLIST_POLL_INTERVAL
                     )
-
                     continue
-
-            # ------------------------------------------------
-            # New segments
-            # ------------------------------------------------
 
             segments = parsed.get(
                 "segments",
                 [],
             )
-
             new_segments = [
                 url
                 for url in segments
                 if url not in downloaded
             ]
-
             if new_segments:
-
                 log(
                     "[RECORDER] New segments: "
                     f"{len(new_segments)}"
                 )
 
-            # ------------------------------------------------
-            # Download segments
-            # ------------------------------------------------
-
             for segment_url in (
                 new_segments
             ):
-
                 if await check_stop():
                     break
 
                 segment_number = (
                     len(segment_files)
                 )
-
                 filename = (
                     f"{segment_number:08d}.ts"
                 )
-
                 path = (
                     SEGMENTS_DIR
                     / filename
                 )
 
-                ok = await download_segment(
-                    session,
-                    segment_url,
-                    path,
-                    headers,
-                )
+                ok = False
+                seg_status = None
+                for attempt in range(MAX_SEGMENT_RETRIES):
+                    ok, seg_status = await download_segment(
+                        session,
+                        segment_url,
+                        path,
+                        headers,
+                    )
+                    if ok:
+                        break
+                    await asyncio.sleep(2)
 
                 if ok:
-
+                    consecutive_segment_errors = 0
                     downloaded.add(
                         segment_url
                     )
-
                     segment_files.append(
                         path
                     )
-
                     log(
                         "[SEGMENT] Saved "
                         f"{filename} "
                         f"({path.stat().st_size} bytes)"
                     )
-
                 else:
-
+                    consecutive_segment_errors += 1
                     log(
-                        "[SEGMENT] Failed: "
-                        f"{segment_url}"
+                        f"[SEGMENT] Failed after retries: "
+                        f"{segment_url} (HTTP {seg_status})"
                     )
+                    if seg_status in (402, 403, 404, 410):
+                        log("[RECORDER] Premium/Ended detected via HTTP status.")
+                        await send_message(
+                            f"⚠️ التسجيل #{RECORD_ID} توقف.\n\n"
+                            "السبب:\n"
+                            "تحول البث إلى خاص (Premium) أو انتهى."
+                        )
+                        stop_requested = True
+                        break
+                    if consecutive_segment_errors >= 5:
+                        log("[RECORDER] Too many consecutive segment errors. Stopping.")
+                        await send_message(
+                            f"⚠️ التسجيل #{RECORD_ID} توقف.\n\n"
+                            "السبب:\n"
+                            "فشل متكرر في تحميل المقاطع."
+                        )
+                        break
 
             if await check_stop():
                 break
@@ -1289,8 +1257,7 @@ async def record_hls(
         f"{len(segment_files)}"
     )
 
-    return segment_files
-
+    return segment_files, start_time_iso, recording_start_time
 
 # ============================================================
 # MP4 muxing
@@ -1314,13 +1281,10 @@ def create_concat_file(
         "w",
         encoding="utf-8",
     ) as file:
-
         for path in segment_files:
-
             absolute_path = (
                 path.resolve()
             )
-
             escaped = (
                 str(absolute_path)
                 .replace(
@@ -1328,7 +1292,6 @@ def create_concat_file(
                     "'\\''",
                 )
             )
-
             file.write(
                 f"file '{escaped}'\n"
             )
@@ -1340,11 +1303,9 @@ def mux_segments(
     segment_files,
 ):
     if not segment_files:
-
         log(
             "[MUX] No recorded segments."
         )
-
         return None
 
     OUTPUT_DIR.mkdir(
@@ -1388,7 +1349,6 @@ def mux_segments(
     ]
 
     try:
-
         result = subprocess.run(
             command,
             capture_output=True,
@@ -1396,24 +1356,19 @@ def mux_segments(
         )
 
         if result.returncode != 0:
-
             log(
                 "[MUX] FFmpeg failed:"
             )
-
             log(
                 result.stderr[-5000:]
             )
-
             return None
 
         if not output_file.exists():
-
             log(
                 "[MUX] Output file was "
                 "not created."
             )
-
             return None
 
         size_mb = (
@@ -1430,14 +1385,11 @@ def mux_segments(
         return output_file
 
     except Exception as exc:
-
         log(
             "[MUX] Exception: "
             f"{exc}"
         )
-
         return None
-
 
 # ============================================================
 # Split large MP4 into valid MP4 video parts
@@ -1447,12 +1399,6 @@ def mux_part(
     segment_files,
     part_number,
 ):
-    """
-    Creates one valid MP4 from a group of TS segments.
-
-    No video re-encoding is performed.
-    """
-
     if not segment_files:
         return None
 
@@ -1498,7 +1444,6 @@ def mux_part(
     ]
 
     try:
-
         result = subprocess.run(
             command,
             capture_output=True,
@@ -1506,95 +1451,64 @@ def mux_part(
         )
 
         if result.returncode != 0:
-
             log(
                 "[PART] FFmpeg failed for "
                 f"Part {part_number}:"
             )
-
             log(
                 result.stderr[-3000:]
             )
-
             try:
                 part_file.unlink(
                     missing_ok=True
                 )
             except Exception:
                 pass
-
             return None
 
         if not part_file.exists():
-
             log(
                 "[PART] FFmpeg completed but "
                 "output file does not exist: "
                 f"{part_file}"
             )
-
             return None
 
         size = part_file.stat().st_size
 
         if size <= 0:
-
             log(
                 "[PART] Output file is empty: "
                 f"{part_file}"
             )
-
             try:
                 part_file.unlink(
                     missing_ok=True
                 )
             except Exception:
                 pass
-
             return None
 
         return part_file
 
     except Exception as exc:
-
         log(
             "[PART] Exception while "
             f"creating Part {part_number}: "
             f"{exc}"
         )
-
         try:
             part_file.unlink(
                 missing_ok=True
             )
         except Exception:
             pass
-
         return None
 
 
 def split_recording_into_parts(
     segment_files,
 ):
-    """
-    Splits the recorded TS segments into valid MP4 files.
-
-    The split is performed only between complete HLS segments.
-    No arbitrary byte splitting is used.
-
-    Video/audio are copied with -c copy.
-    No re-encoding is performed.
-
-    The algorithm first estimates groups using the TS byte sizes,
-    then muxes each group and verifies the actual MP4 size.
-
-    If a resulting MP4 is still too large, that group is divided
-    recursively until the resulting parts fit the target.
-
-    This avoids the previous O(n²) behaviour where FFmpeg was
-    repeatedly muxing the same growing Part hundreds of times.
-    """
-
     if not segment_files:
         return []
 
@@ -1607,11 +1521,9 @@ def split_recording_into_parts(
     ]
 
     if not valid_segments:
-
         log(
             "[PARTS] No valid segment files."
         )
-
         return []
 
     total_bytes = sum(
@@ -1630,18 +1542,11 @@ def split_recording_into_parts(
         f"{total_mb:.2f} MB"
     )
 
-    # --------------------------------------------------------
-    # If recording is already small enough,
-    # the normal complete MP4 will be sent.
-    # --------------------------------------------------------
-
     if total_mb < TELEGRAM_MAX_MB:
-
         log(
             "[PARTS] Recording is small enough "
             "for one Telegram video."
         )
-
         return []
 
     log(
@@ -1653,10 +1558,6 @@ def split_recording_into_parts(
         f"{PART_TARGET_MB} MB"
     )
 
-    # --------------------------------------------------------
-    # Clean old generated parts.
-    # --------------------------------------------------------
-
     PARTS_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -1665,7 +1566,6 @@ def split_recording_into_parts(
     for old_file in PARTS_DIR.glob(
         "*.mp4"
     ):
-
         try:
             old_file.unlink()
         except Exception as exc:
@@ -1674,25 +1574,15 @@ def split_recording_into_parts(
                 f"part {old_file}: {exc}"
             )
 
-    # --------------------------------------------------------
-    # Estimate groups using TS size.
-    #
-    # We intentionally use 90% of the MP4 target because
-    # MP4 container overhead can make the final MP4 slightly
-    # larger than the raw TS total.
-    # --------------------------------------------------------
-
     ESTIMATE_TARGET_BYTES = int(
         PART_TARGET_BYTES * 0.90
     )
 
     groups = []
-
     current_group = []
     current_bytes = 0
 
     for segment in valid_segments:
-
         segment_size = (
             segment.stat().st_size
         )
@@ -1704,18 +1594,15 @@ def split_recording_into_parts(
             + segment_size
             > ESTIMATE_TARGET_BYTES
         ):
-
             groups.append(
                 current_group
             )
-
             current_group = []
             current_bytes = 0
 
         current_group.append(
             segment
         )
-
         current_bytes += (
             segment_size
         )
@@ -1730,14 +1617,6 @@ def split_recording_into_parts(
         f"{len(groups)}"
     )
 
-    # --------------------------------------------------------
-    # Each verified item:
-    #
-    #     (Path, size)
-    #
-    # Recursive verification can split a group further.
-    # --------------------------------------------------------
-
     verified_groups = []
 
     def verify_group(
@@ -1747,19 +1626,13 @@ def split_recording_into_parts(
         if not group:
             return
 
-        # ----------------------------------------------------
-        # One segment only.
-        # ----------------------------------------------------
-
         if len(group) == 1:
-
             part_file = mux_part(
                 group,
                 part_number_hint,
             )
 
             if part_file is None:
-
                 raise RuntimeError(
                     "Failed to mux a single "
                     "HLS segment."
@@ -1782,28 +1655,19 @@ def split_recording_into_parts(
             )
 
             if size < TELEGRAM_MAX_MB:
-
                 verified_groups.append(
                     (
                         part_file,
                         size,
                     )
                 )
-
                 return
 
-            # A single HLS segment larger than
-            # Telegram's limit cannot be safely
-            # split without re-encoding.
             raise RuntimeError(
                 "A single HLS segment produced "
                 f"a {size_mb:.2f} MB MP4, which "
                 "is too large for Telegram."
             )
-
-        # ----------------------------------------------------
-        # Try the whole group once.
-        # ----------------------------------------------------
 
         part_file = mux_part(
             group,
@@ -1811,7 +1675,6 @@ def split_recording_into_parts(
         )
 
         if part_file is None:
-
             raise RuntimeError(
                 f"Failed to mux Part "
                 f"{part_number_hint}."
@@ -1834,27 +1697,14 @@ def split_recording_into_parts(
             f"({len(group)} segments)"
         )
 
-        # ----------------------------------------------------
-        # Fits safely.
-        # ----------------------------------------------------
-
         if size < PART_TARGET_BYTES:
-
             verified_groups.append(
                 (
                     part_file,
                     size,
                 )
             )
-
             return
-
-        # ----------------------------------------------------
-        # Too large.
-        #
-        # Remove oversized temporary MP4 before splitting
-        # the group into smaller groups.
-        # ----------------------------------------------------
 
         try:
             part_file.unlink(
@@ -1864,7 +1714,6 @@ def split_recording_into_parts(
             pass
 
         middle = len(group) // 2
-
         left = group[:middle]
         right = group[middle:]
 
@@ -1881,8 +1730,6 @@ def split_recording_into_parts(
             part_number_hint,
         )
 
-        # Use the number of already-created verified parts
-        # so temporary filenames remain unique.
         next_hint = (
             len(verified_groups) + 1
         )
@@ -1892,16 +1739,9 @@ def split_recording_into_parts(
             next_hint,
         )
 
-    # --------------------------------------------------------
-    # Verify all initial groups.
-    # --------------------------------------------------------
-
     try:
-
         for group in groups:
-
             if stop_requested:
-
                 log(
                     "[PARTS] Stop flag detected "
                     "during part generation."
@@ -1917,29 +1757,20 @@ def split_recording_into_parts(
             )
 
     except Exception as exc:
-
         log(
             "[PARTS] Fatal error while "
             f"creating parts: {exc}"
         )
-
-        # Clean all generated parts.
         for part_file, _ in (
             verified_groups
         ):
-
             try:
                 part_file.unlink(
                     missing_ok=True
                 )
             except Exception:
                 pass
-
         return []
-
-    # --------------------------------------------------------
-    # Normalize filenames sequentially.
-    # --------------------------------------------------------
 
     final_parts = []
 
@@ -1950,7 +1781,6 @@ def split_recording_into_parts(
         verified_groups,
         start=1,
     ):
-
         final_name = (
             PARTS_DIR
             / (
@@ -1960,25 +1790,19 @@ def split_recording_into_parts(
         )
 
         try:
-
             if old_file != final_name:
-
                 if final_name.exists():
-
                     final_name.unlink()
-
                 old_file.rename(
                     final_name
                 )
 
             if not final_name.exists():
-
                 log(
                     "[PARTS] Final part does not "
                     "exist after rename: "
                     f"{final_name}"
                 )
-
                 return []
 
             final_size = (
@@ -1987,18 +1811,15 @@ def split_recording_into_parts(
                 / 1024
             )
 
-            # Absolute safety check.
             if (
                 final_size
                 >= TELEGRAM_MAX_MB
             ):
-
                 log(
                     "[PARTS] SAFETY CHECK FAILED: "
                     f"{final_name.name} = "
                     f"{final_size:.2f} MB"
                 )
-
                 return []
 
             final_parts.append(
@@ -2012,12 +1833,10 @@ def split_recording_into_parts(
             )
 
         except Exception as exc:
-
             log(
                 "[PARTS] Failed to finalize "
                 f"Part {index}: {exc}"
             )
-
             return []
 
     log(
@@ -2026,7 +1845,6 @@ def split_recording_into_parts(
     )
 
     return final_parts
-
 
 # ============================================================
 # Telegram upload
@@ -2041,13 +1859,11 @@ async def send_video_file(
         return False
 
     if not file_path.exists():
-
         log(
             "[TELEGRAM] Output file does "
             "not exist: "
             f"{file_path}"
         )
-
         return False
 
     size_mb = (
@@ -2062,87 +1878,79 @@ async def send_video_file(
     )
 
     if size_mb >= TELEGRAM_MAX_MB:
-
         log(
             "[TELEGRAM] Refusing to upload "
             "a file too close to/over the "
             "Telegram limit: "
             f"{size_mb:.2f} MB"
         )
-
         return False
 
     if part_number is not None:
-
         caption = (
             f"🎥 التسجيل #{RECORD_ID}\n"
             f"Part {part_number}"
         )
-
         if total_parts is not None:
-
             caption += (
                 f" / {total_parts}"
             )
-
     else:
-
         caption = (
             f"🎥 Recording "
             f"#{RECORD_ID}"
         )
 
-    try:
-
-        log(
-            "[TELEGRAM] Uploading video: "
-            f"{file_path.name}"
-        )
-
-        with file_path.open(
-            "rb"
-        ) as file:
-
-            result = (
-                await telegram_request(
-                    "sendVideo",
-                    data={
-                        "chat_id": ADMIN_USER_ID,
-                        "caption": caption,
-                        "supports_streaming": (
-                            "true"
-                        ),
-                    },
-                    file_data=file,
-                    file_name=file_path.name,
-                )
-            )
-
-        if (
-            result
-            and result[0] == 200
-        ):
-
+    MAX_UPLOAD_RETRIES = 3
+    for attempt in range(MAX_UPLOAD_RETRIES):
+        try:
             log(
-                "[TELEGRAM] Video uploaded "
-                "successfully: "
+                f"[TELEGRAM] Uploading video (attempt {attempt+1}): "
                 f"{file_path.name}"
             )
-
-            return True
-
-        log(
-            "[TELEGRAM] Video upload "
-            "failed: "
-            f"{file_path.name}"
-        )
-
-    except Exception as exc:
-
-        log(
-            "[TELEGRAM] Upload failed: "
-            f"{exc}"
-        )
+            with file_path.open(
+                "rb"
+            ) as file:
+                result = (
+                    await telegram_request(
+                        "sendVideo",
+                        data={
+                            "chat_id": ADMIN_USER_ID,
+                            "caption": caption,
+                            "supports_streaming": (
+                                "true"
+                            ),
+                        },
+                        file_data=file,
+                        file_name=file_path.name,
+                    )
+                )
+            if (
+                result
+                and result[0] == 200
+            ):
+                log(
+                    "[TELEGRAM] Video uploaded "
+                    "successfully: "
+                    f"{file_path.name}"
+                )
+                return True
+                
+            log(
+                f"[TELEGRAM] Video upload "
+                f"failed (attempt {attempt+1}): "
+                f"{file_path.name}"
+            )
+        except Exception as exc:
+            log(
+                "[TELEGRAM] Upload failed: "
+                f"{exc}"
+            )
+            
+        if attempt < MAX_UPLOAD_RETRIES - 1:
+            wait_time = 5 * (attempt + 1)
+            log(f"[TELEGRAM] Retrying in {wait_time} seconds...")
+            await asyncio.sleep(wait_time)
 
     return False
 
@@ -2151,28 +1959,15 @@ async def send_recording(
     output_file,
     segment_files,
 ):
-    """
-    Sends the recording to Telegram.
-
-    Small recording:
-        one MP4 video.
-
-    Large recording:
-        multiple valid MP4 videos,
-        each comfortably below 49 MB.
-    """
-
     if not output_file:
         return False
 
     if not output_file.exists():
-
         log(
             "[TELEGRAM] Final MP4 does not "
             "exist: "
             f"{output_file}"
         )
-
         return False
 
     full_size_mb = (
@@ -2186,30 +1981,18 @@ async def send_recording(
         f"{full_size_mb:.2f} MB"
     )
 
-    # --------------------------------------------------------
-    # Small enough: send one video.
-    # --------------------------------------------------------
-
     if full_size_mb < TELEGRAM_MAX_MB:
-
         await send_message(
             f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
             f"📦 الحجم: {full_size_mb:.1f} MB\n"
             "📤 جارٍ إرسال الفيديو..."
         )
-
         uploaded = await send_video_file(
             output_file
         )
-
         if uploaded:
             return True
-
         return False
-
-    # --------------------------------------------------------
-    # Large recording.
-    # --------------------------------------------------------
 
     await send_message(
         f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
@@ -2226,12 +2009,10 @@ async def send_recording(
     )
 
     if not parts:
-
         await send_message(
             "❌ تعذر تقسيم التسجيل "
             "إلى أجزاء قابلة للإرسال."
         )
-
         return False
 
     total_parts = len(parts)
@@ -2248,21 +2029,16 @@ async def send_recording(
         parts,
         start=1,
     ):
-
         if not part_file.exists():
-
             log(
                 "[TELEGRAM] Part is missing: "
                 f"{part_file}"
             )
-
             all_uploaded = False
-
             await send_message(
                 f"⚠️ الجزء {index} من "
                 f"{total_parts} غير موجود."
             )
-
             continue
 
         size_mb = (
@@ -2284,28 +2060,21 @@ async def send_recording(
         )
 
         if not uploaded:
-
             all_uploaded = False
-
             await send_message(
                 f"⚠️ تعذر إرسال "
                 f"Part {index} من "
                 f"{total_parts}."
             )
-
-            # Continue trying the remaining parts.
             continue
 
     if all_uploaded:
-
         await send_message(
             f"✅ تم إرسال التسجيل "
             f"#{RECORD_ID} بالكامل "
             f"في {total_parts} أجزاء."
         )
-
     else:
-
         await send_message(
             f"⚠️ انتهى إرسال التسجيل "
             f"#{RECORD_ID}، لكن تعذر "
@@ -2314,47 +2083,40 @@ async def send_recording(
 
     return all_uploaded
 
-
 # ============================================================
 # Main
 # ============================================================
 
 async def main():
-
     if not PAGE_URL:
-
         print(
             "Usage: python record_once.py "
             "\"https://example.com/stream/...\""
         )
-
         return 1
 
     log(
         "Starting persistent HLS recorder..."
     )
-
     log(
         f"Opening stream page: "
         f"{PAGE_URL}"
     )
-
     log(
         f"[SESSION] Record ID: "
         f"{RECORD_ID}"
     )
-
     log(
         f"[STOP] Watching GitHub file: "
         f"{STOP_FILE}"
     )
 
     discovered = []
-
     segment_files = []
+    start_time_iso = datetime.utcnow().isoformat()
+    recording_start_time = time.time()
 
     async with async_playwright() as playwright:
-
         browser = await playwright.chromium.launch(
             headless=True,
             args=[
@@ -2380,46 +2142,30 @@ async def main():
 
         page = await context.new_page()
 
-        # ----------------------------------------------------
-        # HLS network listener
-        # ----------------------------------------------------
-
         async def handle_response(
             response
         ):
             try:
-
                 url = response.url
-
                 if is_m3u8(url):
-
                     if url not in discovered:
-
                         discovered.append(
                             url
                         )
-
                         log(
                             "[HLS] Discovered "
                             "from network response: "
                             f"{url}"
                         )
-
             except Exception:
                 pass
 
-        # Listener MUST exist before goto().
         page.on(
             "response",
             handle_response,
         )
 
-        # ----------------------------------------------------
-        # Open stream page
-        # ----------------------------------------------------
-
         try:
-
             await page.goto(
                 PAGE_URL,
                 wait_until=(
@@ -2427,17 +2173,11 @@ async def main():
                 ),
                 timeout=60000,
             )
-
         except Exception as exc:
-
             log(
                 f"[PAGE] goto warning: "
                 f"{exc}"
             )
-
-        # ----------------------------------------------------
-        # HLS discovery period
-        # ----------------------------------------------------
 
         discovery_started = time.time()
 
@@ -2446,7 +2186,6 @@ async def main():
             - discovery_started
             < DISCOVERY_TIMEOUT
         ):
-
             if await check_stop():
                 break
 
@@ -2456,7 +2195,6 @@ async def main():
             )
 
             if discovered:
-
                 if (
                     time.time()
                     - discovery_started
@@ -2473,54 +2211,36 @@ async def main():
             discovered,
         )
 
-        # ----------------------------------------------------
-        # Stop before recording
-        # ----------------------------------------------------
-
         if await check_stop():
-
             log(
                 "[STOP] Stop requested "
                 "before recording began."
             )
-
             await browser.close()
-
             await send_message(
                 f"⏹️ تم إيقاف التسجيل "
                 f"#{RECORD_ID} قبل بدء "
                 "تسجيل المقاطع."
             )
-
+            await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
             return 0
 
-        # ----------------------------------------------------
-        # No HLS
-        # ----------------------------------------------------
-
         if not discovered:
-
             log(
                 "[HLS] No HLS playlist "
                 "discovered."
             )
-
             await send_message(
                 "❌ لم يتم اكتشاف رابط HLS للبث."
             )
-
             await browser.close()
-
+            await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
             return 1
 
         log(
             "[HLS] Total discovered URLs: "
             f"{len(discovered)}"
         )
-
-        # ----------------------------------------------------
-        # Find usable playlist
-        # ----------------------------------------------------
 
         playlist_url, playlist = (
             await find_live_playlist(
@@ -2533,16 +2253,13 @@ async def main():
             not playlist_url
             or not playlist
         ):
-
             if await check_stop():
-
                 await browser.close()
-
                 await send_message(
                     f"⏹️ تم إيقاف التسجيل "
                     f"#{RECORD_ID}."
                 )
-
+                await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
                 return 0
 
             log(
@@ -2550,25 +2267,19 @@ async def main():
                 "were not usable "
                 "media playlists."
             )
-
             await send_message(
                 "❌ تم اكتشاف HLS لكن "
                 "تعذر الوصول إلى قائمة "
                 "المقاطع الخاصة بالبث."
             )
-
             await browser.close()
-
+            await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
             return 1
 
         log(
             "[HLS] Recording playlist: "
             f"{playlist_url}"
         )
-
-        # ----------------------------------------------------
-        # Browser session headers
-        # ----------------------------------------------------
 
         headers = (
             await build_browser_session(
@@ -2577,11 +2288,7 @@ async def main():
             )
         )
 
-        # ----------------------------------------------------
-        # Record
-        # ----------------------------------------------------
-
-        segment_files = (
+        segment_files, start_time_iso, recording_start_time = (
             await record_hls(
                 context,
                 page,
@@ -2591,153 +2298,134 @@ async def main():
             )
         )
 
-        # ----------------------------------------------------
-        # Close browser
-        # ----------------------------------------------------
-
         try:
             await browser.close()
         except Exception:
             pass
-
-    # ========================================================
-    # Finalize
-    # ========================================================
 
     log(
         "Stopping recorder and "
         "preparing final MP4..."
     )
 
-    # --------------------------------------------------------
-    # No segments
-    # --------------------------------------------------------
-
     if not segment_files:
-
         log(
             "[MUX] No recorded segments."
         )
-
         if stop_requested:
-
             await send_message(
                 f"⏹️ تم إيقاف التسجيل "
                 f"#{RECORD_ID}، لكن لم "
                 "يتم تسجيل أي مقطع."
             )
-
         else:
-
             await send_message(
                 "❌ لم يتم تسجيل أي جزء من البث."
             )
-
+        await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
+        await github_delete_file(f".recorder/status/{RECORD_ID}.json", f"Remove status {RECORD_ID}")
         return 0
-
-    # --------------------------------------------------------
-    # Create complete MP4
-    # --------------------------------------------------------
 
     output_file = mux_segments(
         segment_files
     )
 
     if not output_file:
-
         await send_message(
             "❌ فشل إنشاء ملف MP4 بعد "
             "انتهاء التسجيل."
         )
-
+        await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
+        await github_delete_file(f".recorder/status/{RECORD_ID}.json", f"Remove status {RECORD_ID}")
         return 1
-
-    # --------------------------------------------------------
-    # Send complete recording / parts
-    # --------------------------------------------------------
 
     uploaded = await send_recording(
         output_file,
         segment_files,
     )
 
+    duration = int(time.time() - recording_start_time)
+    full_size_mb = output_file.stat().st_size / 1024 / 1024 if output_file and output_file.exists() else 0
+    parts_count = len(list(PARTS_DIR.glob("*.mp4"))) if PARTS_DIR.exists() else 1
+
+    await github_update_file(
+        f".recorder/history/{RECORD_ID}.json",
+        {
+            "record_id": RECORD_ID,
+            "url": PAGE_URL,
+            "started_at": start_time_iso,
+            "ended_at": datetime.utcnow().isoformat(),
+            "duration_seconds": duration,
+            "size_mb": round(full_size_mb, 2),
+            "parts_count": parts_count,
+            "status": "success" if uploaded else "failed"
+        },
+        f"History {RECORD_ID}"
+    )
+
+    await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
+    await github_delete_file(f".recorder/status/{RECORD_ID}.json", f"Remove status {RECORD_ID}")
+
     if uploaded:
-
+        try:
+            if WORK_DIR.exists():
+                shutil.rmtree(WORK_DIR)
+                log("[CLEANUP] Workspace cleaned.")
+        except Exception as e:
+            log(f"[CLEANUP] Error: {e}")
+            
         if stop_requested:
-
             await send_message(
                 f"⏹️ تم إيقاف التسجيل "
                 f"#{RECORD_ID} وإرسال "
                 "التسجيل بنجاح."
             )
-
         else:
-
             await send_message(
                 f"✅ انتهى التسجيل "
                 f"#{RECORD_ID} وتم إرسال "
                 "التسجيل بنجاح."
             )
-
     else:
-
         await send_message(
             f"⚠️ انتهى التسجيل "
             f"#{RECORD_ID}، لكن تعذر "
             "إرسال التسجيل بالكامل."
         )
-
         return 1
 
-    # --------------------------------------------------------
-    # GitHub runner cleans workspace.
-    # --------------------------------------------------------
-
     return 0
-
 
 # ============================================================
 # Entrypoint
 # ============================================================
 
 if __name__ == "__main__":
-
     try:
-
         exit_code = asyncio.run(
             main()
         )
-
         sys.exit(
             exit_code
         )
-
     except KeyboardInterrupt:
-
         log(
             "[STOP] Keyboard interrupt."
         )
-
         sys.exit(0)
-
     except Exception as exc:
-
         log(
             "[FATAL] "
             f"{type(exc).__name__}: "
             f"{exc}"
         )
-
         try:
-
             asyncio.run(
                 send_message(
                     "❌ حدث خطأ غير متوقع "
                     "أثناء التسجيل."
                 )
             )
-
         except Exception:
             pass
-
         sys.exit(1)
