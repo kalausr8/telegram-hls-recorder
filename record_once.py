@@ -20,24 +20,48 @@ from playwright.async_api import async_playwright
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "kalausr8")
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "telegram-hls-recorder")
-RECORD_ID = os.environ.get("RECORD_ID", "UNKNOWN")
 
-PAGE_URL = sys.argv[1] if len(sys.argv) > 1 else ""
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_OWNER = os.environ.get(
+    "GITHUB_OWNER",
+    "kalausr8",
+)
+GITHUB_REPO = os.environ.get(
+    "GITHUB_REPO",
+    "telegram-hls-recorder",
+)
+
+RECORD_ID = os.environ.get(
+    "RECORD_ID",
+    "UNKNOWN",
+)
+
+PAGE_URL = (
+    sys.argv[1].strip()
+    if len(sys.argv) > 1
+    else ""
+)
 
 TELEGRAM_MAX_MB = 49
+
 DISCOVERY_TIMEOUT = 30
 PLAYLIST_TIMEOUT = 20
 SEGMENT_TIMEOUT = 30
-POLL_INTERVAL = 2.0
+
+# Check stop signal frequently.
+STOP_CHECK_INTERVAL = 2.0
+
+# How long to wait between playlist refreshes.
+PLAYLIST_POLL_INTERVAL = 2.0
+
+# GitHub stop-file API path.
+STOP_FILE = (
+    f".recorder/stop/{RECORD_ID}"
+)
 
 WORK_DIR = Path("recording_work")
 SEGMENTS_DIR = WORK_DIR / "segments"
 OUTPUT_DIR = WORK_DIR / "output"
-
-STOP_FILE = f".recorder/stop/{RECORD_ID}"
 
 stop_requested = False
 
@@ -47,7 +71,10 @@ stop_requested = False
 # ============================================================
 
 def log(message):
-    print(message, flush=True)
+    print(
+        message,
+        flush=True,
+    )
 
 
 # ============================================================
@@ -59,36 +86,66 @@ def request_stop(signum, frame):
 
     if not stop_requested:
         stop_requested = True
-        log(f"[STOP] Received signal {signum}. Stopping recording safely...")
+
+        log(
+            f"[STOP] Received signal {signum}. "
+            "Stopping recording safely..."
+        )
 
 
-signal.signal(signal.SIGTERM, request_stop)
-signal.signal(signal.SIGINT, request_stop)
+signal.signal(
+    signal.SIGTERM,
+    request_stop,
+)
+
+signal.signal(
+    signal.SIGINT,
+    request_stop,
+)
 
 
 # ============================================================
 # Telegram
 # ============================================================
 
-async def telegram_request(method, data=None, file_data=None):
+async def telegram_request(
+    method,
+    data=None,
+    file_data=None,
+):
     if not BOT_TOKEN:
+        log(
+            "[TELEGRAM] BOT_TOKEN is missing."
+        )
         return None
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/{method}"
+    )
 
     timeout = aiohttp.ClientTimeout(
-        total=120,
+        total=180,
         connect=20,
-        sock_read=100,
+        sock_read=150,
     )
 
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
+
             if file_data is not None:
                 form = aiohttp.FormData()
 
-                for key, value in (data or {}).items():
-                    form.add_field(key, str(value))
+                for key, value in (
+                    data or {}
+                ).items():
+
+                    form.add_field(
+                        key,
+                        str(value),
+                    )
 
                 form.add_field(
                     "video",
@@ -97,19 +154,58 @@ async def telegram_request(method, data=None, file_data=None):
                     content_type="video/mp4",
                 )
 
-                async with session.post(url, data=form) as response:
-                    text = await response.text()
-                    log(f"[TELEGRAM] {method}: HTTP {response.status}")
-                    return response.status, text
+                async with session.post(
+                    url,
+                    data=form,
+                ) as response:
 
-            async with session.post(url, json=data or {}) as response:
+                    text = await response.text()
+
+                    log(
+                        f"[TELEGRAM] {method}: "
+                        f"HTTP {response.status}"
+                    )
+
+                    if response.status != 200:
+                        log(
+                            f"[TELEGRAM] Response: "
+                            f"{text[:2000]}"
+                        )
+
+                    return (
+                        response.status,
+                        text,
+                    )
+
+            async with session.post(
+                url,
+                json=data or {},
+            ) as response:
+
                 text = await response.text()
-                log(f"[TELEGRAM] {method}: HTTP {response.status}")
-                return response.status, text
+
+                log(
+                    f"[TELEGRAM] {method}: "
+                    f"HTTP {response.status}"
+                )
+
+                if response.status != 200:
+                    log(
+                        f"[TELEGRAM] Response: "
+                        f"{text[:2000]}"
+                    )
+
+                return (
+                    response.status,
+                    text,
+                )
 
     except Exception as exc:
-        log(f"[TELEGRAM] Error: {exc}")
-        return None
+        log(
+            f"[TELEGRAM] Error: {exc}"
+        )
+
+    return None
 
 
 async def send_message(text):
@@ -126,70 +222,194 @@ async def send_message(text):
 
 
 # ============================================================
-# GitHub cooperative stop
+# GitHub stop signal
 # ============================================================
 
 async def github_stop_requested():
     """
-    Checks whether Cloudflare Worker created:
+    Checks:
 
         .recorder/stop/{RECORD_ID}
 
-    in the repository.
+    The file is created by the Cloudflare Worker.
+
+    Accepted stop-file formats:
+
+    1. JSON:
+       {
+         "record_id": "ABC123",
+         "stop": true
+       }
+
+    2. Any non-empty file containing the exact
+       RECORD_ID and/or the word "stop".
+
+    This makes the stop mechanism more tolerant.
     """
 
-    if not GITHUB_TOKEN or not RECORD_ID:
+    if not GITHUB_TOKEN:
+        return False
+
+    if not RECORD_ID:
         return False
 
     url = (
         f"https://api.github.com/repos/"
-        f"{GITHUB_OWNER}/{GITHUB_REPO}/contents/{STOP_FILE}"
+        f"{GITHUB_OWNER}/"
+        f"{GITHUB_REPO}/"
+        f"contents/"
+        f"{STOP_FILE}"
     )
 
     headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
+        "Authorization": (
+            f"Bearer {GITHUB_TOKEN}"
+        ),
+        "Accept": (
+            "application/vnd.github+json"
+        ),
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "telegram-hls-recorder",
+        "User-Agent": (
+            "telegram-hls-recorder"
+        ),
     }
 
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(
+        total=10,
+        connect=5,
+        sock_read=8,
+    )
 
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers) as response:
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
+
+            async with session.get(
+                url,
+                headers=headers,
+            ) as response:
 
                 if response.status == 404:
                     return False
 
                 if response.status != 200:
                     log(
-                        f"[STOP] GitHub stop check HTTP "
-                        f"{response.status}"
+                        "[STOP] GitHub stop check "
+                        f"HTTP {response.status}"
                     )
                     return False
 
                 data = await response.json()
 
-                if data.get("content"):
-                    try:
-                        raw = base64.b64decode(
-                            data["content"].replace("\n", "")
-                        ).decode("utf-8")
+                encoded = data.get(
+                    "content"
+                )
 
-                        obj = json.loads(raw)
+                if not encoded:
+                    return False
 
-                        if (
-                            obj.get("record_id") == RECORD_ID
-                            and obj.get("stop") is True
-                        ):
-                            return True
+                try:
+                    raw = base64.b64decode(
+                        encoded.replace(
+                            "\n",
+                            "",
+                        )
+                    ).decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                except Exception as exc:
+                    log(
+                        "[STOP] Base64 decode failed: "
+                        f"{exc}"
+                    )
+                    return False
 
-                    except Exception as exc:
-                        log(f"[STOP] Could not parse stop file: {exc}")
+                raw_stripped = raw.strip()
+
+                # ------------------------------------------------
+                # First: try JSON
+                # ------------------------------------------------
+
+                try:
+                    obj = json.loads(
+                        raw_stripped
+                    )
+
+                    record_matches = (
+                        str(
+                            obj.get(
+                                "record_id",
+                                "",
+                            )
+                        )
+                        == str(RECORD_ID)
+                    )
+
+                    stop_value = obj.get(
+                        "stop"
+                    )
+
+                    if (
+                        record_matches
+                        and stop_value is True
+                    ):
+                        log(
+                            "[STOP] Valid JSON "
+                            "stop signal detected."
+                        )
+                        return True
+
+                except Exception:
+                    pass
+
+                # ------------------------------------------------
+                # Second: tolerant plain-text detection
+                # ------------------------------------------------
+
+                lower = raw_stripped.lower()
+
+                record_matches = (
+                    str(RECORD_ID).lower()
+                    in lower
+                )
+
+                stop_matches = (
+                    "stop" in lower
+                    or "true" in lower
+                    or lower == "1"
+                )
+
+                if (
+                    record_matches
+                    and stop_matches
+                ):
+                    log(
+                        "[STOP] Valid text "
+                        "stop signal detected."
+                    )
+                    return True
+
+                # If the exact record-specific stop file exists,
+                # treat it as a stop signal even if its contents
+                # are unusual.
+                if raw_stripped:
+                    log(
+                        "[STOP] Stop file exists for "
+                        f"{RECORD_ID}; treating it "
+                        "as a stop signal."
+                    )
+                    return True
+
+    except asyncio.CancelledError:
+        raise
 
     except Exception as exc:
-        log(f"[STOP] GitHub check failed: {exc}")
+        log(
+            "[STOP] GitHub check failed: "
+            f"{exc}"
+        )
 
     return False
 
@@ -202,7 +422,12 @@ async def check_stop():
 
     if await github_stop_requested():
         stop_requested = True
-        log("[STOP] Cooperative stop signal detected.")
+
+        log(
+            "[STOP] Cooperative stop signal "
+            "detected."
+        )
+
         return True
 
     return False
@@ -223,28 +448,45 @@ def is_m3u8(url):
     if not url:
         return False
 
-    return ".m3u8" in url.lower()
+    return (
+        ".m3u8"
+        in url.lower()
+    )
 
 
 def safe_filename(value):
-    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+    value = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        value,
+    )
+
     return value[:180]
 
 
 def origin_from_url(url):
     parsed = urlparse(url)
 
-    if not parsed.scheme or not parsed.netloc:
+    if (
+        not parsed.scheme
+        or not parsed.netloc
+    ):
         return ""
 
-    return f"{parsed.scheme}://{parsed.netloc}"
+    return (
+        f"{parsed.scheme}://"
+        f"{parsed.netloc}"
+    )
 
 
 # ============================================================
 # Browser session headers
 # ============================================================
 
-async def build_browser_session(page, context):
+async def build_browser_session(
+    page,
+    context,
+):
     user_agent = await page.evaluate(
         "() => navigator.userAgent"
     )
@@ -256,12 +498,16 @@ async def build_browser_session(page, context):
         for cookie in cookies
     )
 
-    origin = origin_from_url(PAGE_URL)
+    origin = origin_from_url(
+        PAGE_URL
+    )
 
     headers = {
         "User-Agent": user_agent,
         "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": (
+            "en-US,en;q=0.9"
+        ),
         "Referer": PAGE_URL,
     }
 
@@ -269,10 +515,12 @@ async def build_browser_session(page, context):
         headers["Origin"] = origin
 
     if cookie_header:
-        headers["Cookie"] = cookie_header
+        headers["Cookie"] = (
+            cookie_header
+        )
 
     log(
-        f"[SESSION] Browser cookies: "
+        "[SESSION] Browser cookies: "
         f"{len(cookies)}"
     )
 
@@ -283,7 +531,14 @@ async def build_browser_session(page, context):
 # HLS discovery
 # ============================================================
 
-async def inspect_page_for_hls(page, discovered):
+async def inspect_page_for_hls(
+    page,
+    discovered,
+):
+    # --------------------------------------------------------
+    # HTML
+    # --------------------------------------------------------
+
     try:
         html = await page.content()
 
@@ -294,36 +549,66 @@ async def inspect_page_for_hls(page, discovered):
         )
 
         for url in found:
-            url = url.replace("&amp;", "&")
+
+            url = url.replace(
+                "&amp;",
+                "&",
+            )
 
             if url not in discovered:
-                discovered.append(url)
-                log(f"[HLS] Discovered from HTML: {url}")
 
-    except Exception as exc:
-        log(f"[HLS] HTML inspection failed: {exc}")
+                discovered.append(
+                    url
+                )
 
-    try:
-        performance_urls = await page.evaluate(
-            """
-            () => performance.getEntriesByType('resource')
-                .map(e => e.name)
-                .filter(n => n.includes('.m3u8'))
-            """
-        )
-
-        for url in performance_urls:
-            if url not in discovered:
-                discovered.append(url)
                 log(
-                    "[HLS] Discovered from performance: "
+                    "[HLS] Discovered "
+                    "from HTML: "
                     f"{url}"
                 )
 
     except Exception as exc:
         log(
-            "[HLS] Performance inspection failed: "
-            f"{exc}"
+            "[HLS] HTML inspection "
+            f"failed: {exc}"
+        )
+
+    # --------------------------------------------------------
+    # Performance API
+    # --------------------------------------------------------
+
+    try:
+        performance_urls = (
+            await page.evaluate(
+                """
+                () => performance
+                    .getEntriesByType('resource')
+                    .map(e => e.name)
+                    .filter(
+                        n => n.includes('.m3u8')
+                    )
+                """
+            )
+        )
+
+        for url in performance_urls:
+
+            if url not in discovered:
+
+                discovered.append(
+                    url
+                )
+
+                log(
+                    "[HLS] Discovered "
+                    "from performance: "
+                    f"{url}"
+                )
+
+    except Exception as exc:
+        log(
+            "[HLS] Performance inspection "
+            f"failed: {exc}"
         )
 
 
@@ -331,7 +616,10 @@ async def inspect_page_for_hls(page, discovered):
 # Playlist parsing
 # ============================================================
 
-def parse_playlist(text, playlist_url):
+def parse_playlist(
+    text,
+    playlist_url,
+):
     lines = [
         line.strip()
         for line in text.splitlines()
@@ -350,9 +638,18 @@ def parse_playlist(text, playlist_url):
 
     is_master = False
 
-    for index, line in enumerate(lines):
+    for index, line in enumerate(
+        lines
+    ):
 
-        if line.startswith("#EXT-X-STREAM-INF"):
+        # ----------------------------------------------------
+        # Master playlist
+        # ----------------------------------------------------
+
+        if line.startswith(
+            "#EXT-X-STREAM-INF"
+        ):
+
             is_master = True
 
             bandwidth = 0
@@ -365,7 +662,9 @@ def parse_playlist(text, playlist_url):
             )
 
             if match:
-                bandwidth = int(match.group(1))
+                bandwidth = int(
+                    match.group(1)
+                )
 
             match = re.search(
                 r"RESOLUTION=([0-9]+x[0-9]+)",
@@ -374,12 +673,23 @@ def parse_playlist(text, playlist_url):
             )
 
             if match:
-                resolution = match.group(1)
+                resolution = (
+                    match.group(1)
+                )
 
-            if index + 1 < len(lines):
-                next_line = lines[index + 1]
+            if (
+                index + 1
+                < len(lines)
+            ):
 
-                if not next_line.startswith("#"):
+                next_line = (
+                    lines[index + 1]
+                )
+
+                if not next_line.startswith(
+                    "#"
+                ):
+
                     variant_url = urljoin(
                         playlist_url,
                         next_line,
@@ -393,12 +703,27 @@ def parse_playlist(text, playlist_url):
                         }
                     )
 
-        elif line.startswith("#EXTINF:"):
+        # ----------------------------------------------------
+        # Media playlist
+        # ----------------------------------------------------
 
-            if index + 1 < len(lines):
-                segment_url = lines[index + 1]
+        elif line.startswith(
+            "#EXTINF:"
+        ):
 
-                if not segment_url.startswith("#"):
+            if (
+                index + 1
+                < len(lines)
+            ):
+
+                segment_url = (
+                    lines[index + 1]
+                )
+
+                if not segment_url.startswith(
+                    "#"
+                ):
+
                     segments.append(
                         urljoin(
                             playlist_url,
@@ -424,45 +749,61 @@ def parse_playlist(text, playlist_url):
 # Browser HLS request
 # ============================================================
 
-async def browser_get_playlist(context, url):
-    log(f"[PLAYLIST] Browser GET: {url}")
+async def browser_get_playlist(
+    context,
+    url,
+):
+    log(
+        f"[PLAYLIST] Browser GET: {url}"
+    )
 
     try:
-        request = await context.request.get(
-            url,
-            headers={
-                "Accept": (
-                    "application/vnd.apple.mpegurl,"
-                    "application/x-mpegURL,"
-                    "*/*"
+        request = (
+            await context.request.get(
+                url,
+                headers={
+                    "Accept": (
+                        "application/vnd.apple."
+                        "mpegurl,"
+                        "application/x-mpegURL,"
+                        "*/*"
+                    ),
+                    "Referer": PAGE_URL,
+                },
+                timeout=(
+                    PLAYLIST_TIMEOUT * 1000
                 ),
-                "Referer": PAGE_URL,
-            },
-            timeout=PLAYLIST_TIMEOUT * 1000,
+            )
         )
 
         status = request.status
 
         log(
-            f"[PLAYLIST] HTTP {status}: {url}"
+            "[PLAYLIST] HTTP "
+            f"{status}: {url}"
         )
 
-        if status < 200 or status >= 300:
+        if (
+            status < 200
+            or status >= 300
+        ):
             return None, status
 
         text = await request.text()
 
         log(
-            f"[PLAYLIST] Received {len(text)} bytes"
+            "[PLAYLIST] Received "
+            f"{len(text)} bytes"
         )
 
         return text, status
 
     except Exception as exc:
         log(
-            f"[PLAYLIST] Browser request failed: "
-            f"{exc}"
+            "[PLAYLIST] Browser request "
+            f"failed: {exc}"
         )
+
         return None, None
 
 
@@ -470,11 +811,15 @@ async def browser_get_playlist(context, url):
 # Find live media playlist
 # ============================================================
 
-async def find_live_playlist(context, discovered):
+async def find_live_playlist(
+    context,
+    discovered,
+):
     checked = set()
 
-    # First try discovered URLs.
-    candidates = list(discovered)
+    candidates = list(
+        discovered
+    )
 
     for url in candidates:
 
@@ -486,9 +831,11 @@ async def find_live_playlist(context, discovered):
 
         checked.add(url)
 
-        text, status = await browser_get_playlist(
-            context,
-            url,
+        text, status = (
+            await browser_get_playlist(
+                context,
+                url,
+            )
         )
 
         if not text:
@@ -499,27 +846,50 @@ async def find_live_playlist(context, discovered):
             url,
         )
 
-        if parsed["type"] == "media":
-            if parsed["segments"]:
-                log(
-                    "[HLS] Usable media playlist found:"
-                    f" {url}"
-                )
+        # ----------------------------------------------------
+        # Direct media playlist
+        # ----------------------------------------------------
 
-                return url, parsed
+        if (
+            parsed["type"] == "media"
+            and parsed["segments"]
+        ):
 
-        elif parsed["type"] == "master":
+            log(
+                "[HLS] Usable media "
+                "playlist found: "
+                f"{url}"
+            )
 
-            variants = parsed["variants"]
+            return (
+                url,
+                parsed,
+            )
+
+        # ----------------------------------------------------
+        # Master playlist
+        # ----------------------------------------------------
+
+        if (
+            parsed["type"] == "master"
+        ):
+
+            variants = parsed[
+                "variants"
+            ]
 
             variants.sort(
-                key=lambda x: x.get("bandwidth", 0),
+                key=lambda x: x.get(
+                    "bandwidth",
+                    0,
+                ),
                 reverse=True,
             )
 
             log(
-                f"[HLS] Master playlist contains "
-                f"{len(variants)} variants."
+                "[HLS] Master playlist "
+                f"contains {len(variants)} "
+                "variants."
             )
 
             for variant in variants:
@@ -527,19 +897,26 @@ async def find_live_playlist(context, discovered):
                 if await check_stop():
                     return None, None
 
-                variant_url = variant["url"]
+                variant_url = (
+                    variant["url"]
+                )
 
-                if variant_url in checked:
+                if (
+                    variant_url
+                    in checked
+                ):
                     continue
 
-                checked.add(variant_url)
+                checked.add(
+                    variant_url
+                )
 
                 log(
                     "[HLS] Trying variant: "
                     f"{variant_url}"
                 )
 
-                variant_text, variant_status = (
+                variant_text, _ = (
                     await browser_get_playlist(
                         context,
                         variant_url,
@@ -549,18 +926,26 @@ async def find_live_playlist(context, discovered):
                 if not variant_text:
                     continue
 
-                variant_parsed = parse_playlist(
-                    variant_text,
-                    variant_url,
+                variant_parsed = (
+                    parse_playlist(
+                        variant_text,
+                        variant_url,
+                    )
                 )
 
                 if (
-                    variant_parsed["type"] == "media"
-                    and variant_parsed["segments"]
+                    variant_parsed[
+                        "type"
+                    ] == "media"
+                    and variant_parsed[
+                        "segments"
+                    ]
                 ):
+
                     log(
-                        "[HLS] Usable variant found:"
-                        f" {variant_url}"
+                        "[HLS] Usable variant "
+                        "found: "
+                        f"{variant_url}"
                     )
 
                     return (
@@ -582,6 +967,7 @@ async def download_segment(
     headers,
 ):
     try:
+
         timeout = aiohttp.ClientTimeout(
             total=SEGMENT_TIMEOUT
         )
@@ -593,10 +979,13 @@ async def download_segment(
         ) as response:
 
             if response.status != 200:
+
                 log(
-                    f"[SEGMENT] HTTP "
-                    f"{response.status}: {url}"
+                    "[SEGMENT] HTTP "
+                    f"{response.status}: "
+                    f"{url}"
                 )
+
                 return False
 
             data = await response.read()
@@ -604,15 +993,22 @@ async def download_segment(
             if not data:
                 return False
 
-            path.write_bytes(data)
+            path.write_bytes(
+                data
+            )
 
             return True
 
+    except asyncio.CancelledError:
+        raise
+
     except Exception as exc:
+
         log(
-            f"[SEGMENT] Download failed: "
+            "[SEGMENT] Download failed: "
             f"{exc}"
         )
+
         return False
 
 
@@ -627,7 +1023,10 @@ async def record_hls(
     initial_playlist,
     headers,
 ):
-    log("[RECORDER] Starting HLS recording...")
+    log(
+        "[RECORDER] Starting HLS "
+        "recording..."
+    )
 
     SEGMENTS_DIR.mkdir(
         parents=True,
@@ -637,14 +1036,15 @@ async def record_hls(
     downloaded = set()
     segment_files = []
 
-    # Existing segments.
-    initial_segments = initial_playlist.get(
-        "segments",
-        [],
+    initial_segments = (
+        initial_playlist.get(
+            "segments",
+            [],
+        )
     )
 
     log(
-        f"[RECORDER] Initial segments: "
+        "[RECORDER] Initial segments: "
         f"{len(initial_segments)}"
     )
 
@@ -664,20 +1064,41 @@ async def record_hls(
 
         while not stop_requested:
 
+            # ------------------------------------------------
+            # Stop check BEFORE playlist request
+            # ------------------------------------------------
+
             if await check_stop():
                 break
 
-            # Refresh browser session headers.
+            # ------------------------------------------------
+            # Refresh browser session
+            # ------------------------------------------------
+
             try:
-                current_headers = await build_browser_session(
-                    page,
-                    context,
+
+                current_headers = (
+                    await build_browser_session(
+                        page,
+                        context,
+                    )
                 )
 
-                headers.update(current_headers)
+                headers.update(
+                    current_headers
+                )
 
-            except Exception:
-                pass
+            except Exception as exc:
+
+                log(
+                    "[SESSION] Could not "
+                    "refresh headers: "
+                    f"{exc}"
+                )
+
+            # ------------------------------------------------
+            # Fetch playlist
+            # ------------------------------------------------
 
             playlist_text, status = (
                 await browser_get_playlist(
@@ -687,13 +1108,14 @@ async def record_hls(
             )
 
             if not playlist_text:
+
                 log(
-                    "[RECORDER] Playlist request failed; "
-                    "retrying..."
+                    "[RECORDER] Playlist "
+                    "request failed; retrying..."
                 )
 
                 await asyncio.sleep(
-                    POLL_INTERVAL
+                    PLAYLIST_POLL_INTERVAL
                 )
 
                 continue
@@ -703,18 +1125,35 @@ async def record_hls(
                 playlist_url,
             )
 
-            if parsed["type"] == "master":
-                variants = parsed["variants"]
+            # ------------------------------------------------
+            # If master playlist appears again
+            # ------------------------------------------------
+
+            if (
+                parsed["type"]
+                == "master"
+            ):
+
+                variants = parsed[
+                    "variants"
+                ]
 
                 variants.sort(
-                    key=lambda x: x.get("bandwidth", 0),
+                    key=lambda x: x.get(
+                        "bandwidth",
+                        0,
+                    ),
                     reverse=True,
                 )
 
                 switched = False
 
                 for variant in variants:
-                    variant_text, variant_status = (
+
+                    if await check_stop():
+                        break
+
+                    variant_text, _ = (
                         await browser_get_playlist(
                             context,
                             variant["url"],
@@ -724,25 +1163,48 @@ async def record_hls(
                     if not variant_text:
                         continue
 
-                    variant_parsed = parse_playlist(
-                        variant_text,
-                        variant["url"],
+                    variant_parsed = (
+                        parse_playlist(
+                            variant_text,
+                            variant["url"],
+                        )
                     )
 
                     if (
-                        variant_parsed["type"] == "media"
-                        and variant_parsed["segments"]
+                        variant_parsed[
+                            "type"
+                        ] == "media"
+                        and variant_parsed[
+                            "segments"
+                        ]
                     ):
-                        playlist_url = variant["url"]
-                        parsed = variant_parsed
+
+                        playlist_url = (
+                            variant["url"]
+                        )
+
+                        parsed = (
+                            variant_parsed
+                        )
+
                         switched = True
+
                         break
 
+                if stop_requested:
+                    break
+
                 if not switched:
+
                     await asyncio.sleep(
-                        POLL_INTERVAL
+                        PLAYLIST_POLL_INTERVAL
                     )
+
                     continue
+
+            # ------------------------------------------------
+            # New segments
+            # ------------------------------------------------
 
             segments = parsed.get(
                 "segments",
@@ -756,12 +1218,17 @@ async def record_hls(
             ]
 
             if new_segments:
+
                 log(
-                    f"[RECORDER] New segments: "
+                    "[RECORDER] New segments: "
                     f"{len(new_segments)}"
                 )
 
-            for index, segment_url in enumerate(
+            # ------------------------------------------------
+            # Download segments
+            # ------------------------------------------------
+
+            for segment_url in (
                 new_segments
             ):
 
@@ -776,7 +1243,10 @@ async def record_hls(
                     f"{segment_number:08d}.ts"
                 )
 
-                path = SEGMENTS_DIR / filename
+                path = (
+                    SEGMENTS_DIR
+                    / filename
+                )
 
                 ok = await download_segment(
                     session,
@@ -786,6 +1256,7 @@ async def record_hls(
                 )
 
                 if ok:
+
                     downloaded.add(
                         segment_url
                     )
@@ -801,18 +1272,27 @@ async def record_hls(
                     )
 
                 else:
+
                     log(
                         "[SEGMENT] Failed: "
                         f"{segment_url}"
                     )
 
+            # ------------------------------------------------
+            # Immediate stop check after downloading
+            # ------------------------------------------------
+
+            if await check_stop():
+                break
+
             await asyncio.sleep(
-                POLL_INTERVAL
+                PLAYLIST_POLL_INTERVAL
             )
 
     log(
-        f"[RECORDER] Recording stopped. "
-        f"Segments saved: {len(segment_files)}"
+        "[RECORDER] Recording stopped. "
+        f"Segments saved: "
+        f"{len(segment_files)}"
     )
 
     return segment_files
@@ -822,8 +1302,13 @@ async def record_hls(
 # MP4 muxing
 # ============================================================
 
-def create_concat_file(segment_files):
-    concat_file = WORK_DIR / "segments.txt"
+def create_concat_file(
+    segment_files,
+):
+    concat_file = (
+        WORK_DIR
+        / "segments.txt"
+    )
 
     with concat_file.open(
         "w",
@@ -831,13 +1316,17 @@ def create_concat_file(segment_files):
     ) as file:
 
         for path in segment_files:
-            absolute_path = path.resolve()
 
-            escaped = str(
-                absolute_path
-            ).replace(
-                "'",
-                "'\\''",
+            absolute_path = (
+                path.resolve()
+            )
+
+            escaped = (
+                str(absolute_path)
+                .replace(
+                    "'",
+                    "'\\''",
+                )
             )
 
             file.write(
@@ -847,9 +1336,15 @@ def create_concat_file(segment_files):
     return concat_file
 
 
-def mux_segments(segment_files):
+def mux_segments(
+    segment_files,
+):
     if not segment_files:
-        log("[MUX] No recorded segments.")
+
+        log(
+            "[MUX] No recorded segments."
+        )
+
         return None
 
     OUTPUT_DIR.mkdir(
@@ -857,8 +1352,10 @@ def mux_segments(segment_files):
         exist_ok=True,
     )
 
-    concat_file = create_concat_file(
-        segment_files
+    concat_file = (
+        create_concat_file(
+            segment_files
+        )
     )
 
     output_file = (
@@ -867,7 +1364,8 @@ def mux_segments(segment_files):
     )
 
     log(
-        f"[MUX] Creating MP4: {output_file}"
+        f"[MUX] Creating MP4: "
+        f"{output_file}"
     )
 
     command = [
@@ -890,6 +1388,7 @@ def mux_segments(segment_files):
     ]
 
     try:
+
         result = subprocess.run(
             command,
             capture_output=True,
@@ -897,16 +1396,24 @@ def mux_segments(segment_files):
         )
 
         if result.returncode != 0:
+
             log(
                 "[MUX] FFmpeg failed:"
             )
-            log(result.stderr[-5000:])
+
+            log(
+                result.stderr[-5000:]
+            )
+
             return None
 
         if not output_file.exists():
+
             log(
-                "[MUX] Output file was not created."
+                "[MUX] Output file was "
+                "not created."
             )
+
             return None
 
         size_mb = (
@@ -916,16 +1423,19 @@ def mux_segments(segment_files):
         )
 
         log(
-            f"[MUX] MP4 ready: "
+            "[MUX] MP4 ready: "
             f"{size_mb:.2f} MB"
         )
 
         return output_file
 
     except Exception as exc:
+
         log(
-            f"[MUX] Exception: {exc}"
+            "[MUX] Exception: "
+            f"{exc}"
         )
+
         return None
 
 
@@ -933,8 +1443,18 @@ def mux_segments(segment_files):
 # Telegram upload
 # ============================================================
 
-async def send_video(file_path):
+async def send_video(
+    file_path,
+):
     if not file_path:
+        return False
+
+    if not file_path.exists():
+        log(
+            "[TELEGRAM] Output file does "
+            "not exist."
+        )
+
         return False
 
     size_mb = (
@@ -944,49 +1464,67 @@ async def send_video(file_path):
     )
 
     log(
-        f"[TELEGRAM] Final MP4 size: "
+        "[TELEGRAM] Final MP4 size: "
         f"{size_mb:.2f} MB"
     )
 
     if size_mb > TELEGRAM_MAX_MB:
+
         await send_message(
-            "⚠️ انتهى التسجيل، لكن حجم ملف MP4 "
-            f"({size_mb:.1f} MB) أكبر من الحد المسموح."
+            "⚠️ انتهى التسجيل، لكن حجم "
+            "ملف MP4 "
+            f"({size_mb:.1f} MB) "
+            "أكبر من الحد المسموح."
         )
+
         return False
 
     await send_message(
         f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
         f"📦 الحجم: {size_mb:.1f} MB\n"
-        f"📤 جارٍ إرسال الملف..."
+        "📤 جارٍ إرسال الملف..."
     )
 
     try:
+
         with file_path.open(
             "rb"
         ) as file:
 
-            result = await telegram_request(
-                "sendVideo",
-                data={
-                    "chat_id": ADMIN_USER_ID,
-                    "caption": (
-                        f"🎥 Recording #{RECORD_ID}"
-                    ),
-                    "supports_streaming": "true",
-                },
-                file_data=file,
+            result = (
+                await telegram_request(
+                    "sendVideo",
+                    data={
+                        "chat_id": ADMIN_USER_ID,
+                        "caption": (
+                            f"🎥 Recording "
+                            f"#{RECORD_ID}"
+                        ),
+                        "supports_streaming": (
+                            "true"
+                        ),
+                    },
+                    file_data=file,
+                )
             )
 
-        if result and result[0] == 200:
+        if (
+            result
+            and result[0] == 200
+        ):
+
             log(
-                "[TELEGRAM] Video uploaded successfully."
+                "[TELEGRAM] Video uploaded "
+                "successfully."
             )
+
             return True
 
     except Exception as exc:
+
         log(
-            f"[TELEGRAM] Upload failed: {exc}"
+            "[TELEGRAM] Upload failed: "
+            f"{exc}"
         )
 
     return False
@@ -997,11 +1535,14 @@ async def send_video(file_path):
 # ============================================================
 
 async def main():
+
     if not PAGE_URL:
+
         print(
             "Usage: python record_once.py "
             "\"https://example.com/stream/...\""
         )
+
         return 1
 
     log(
@@ -1009,10 +1550,23 @@ async def main():
     )
 
     log(
-        f"Opening stream page: {PAGE_URL}"
+        f"Opening stream page: "
+        f"{PAGE_URL}"
+    )
+
+    log(
+        f"[SESSION] Record ID: "
+        f"{RECORD_ID}"
+    )
+
+    log(
+        f"[STOP] Watching GitHub file: "
+        f"{STOP_FILE}"
     )
 
     discovered = []
+
+    segment_files = []
 
     async with async_playwright() as playwright:
 
@@ -1021,7 +1575,8 @@ async def main():
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
+                "--disable-blink-features="
+                "AutomationControlled",
             ],
         )
 
@@ -1040,16 +1595,28 @@ async def main():
 
         page = await context.new_page()
 
-        async def handle_response(response):
+        # ----------------------------------------------------
+        # HLS network listener
+        # ----------------------------------------------------
+
+        async def handle_response(
+            response
+        ):
             try:
+
                 url = response.url
 
                 if is_m3u8(url):
+
                     if url not in discovered:
-                        discovered.append(url)
+
+                        discovered.append(
+                            url
+                        )
 
                         log(
-                            "[HLS] Discovered from network response: "
+                            "[HLS] Discovered "
+                            "from network response: "
                             f"{url}"
                         )
 
@@ -1057,29 +1624,42 @@ async def main():
                 pass
 
         # IMPORTANT:
-        # Listener is attached BEFORE goto().
+        # Listener MUST exist before goto().
         page.on(
             "response",
             handle_response,
         )
 
+        # ----------------------------------------------------
+        # Open stream page
+        # ----------------------------------------------------
+
         try:
+
             await page.goto(
                 PAGE_URL,
-                wait_until="domcontentloaded",
+                wait_until=(
+                    "domcontentloaded"
+                ),
                 timeout=60000,
             )
 
         except Exception as exc:
+
             log(
-                f"[PAGE] goto warning: {exc}"
+                f"[PAGE] goto warning: "
+                f"{exc}"
             )
 
-        # Give the player time to initialize.
+        # ----------------------------------------------------
+        # HLS discovery period
+        # ----------------------------------------------------
+
         discovery_started = time.time()
 
         while (
-            time.time() - discovery_started
+            time.time()
+            - discovery_started
             < DISCOVERY_TIMEOUT
         ):
 
@@ -1092,8 +1672,9 @@ async def main():
             )
 
             if discovered:
-                # Continue briefly so that both master
-                # and live playlists can appear.
+
+                # Give player a little more
+                # time to expose live playlist.
                 if (
                     time.time()
                     - discovery_started
@@ -1101,16 +1682,45 @@ async def main():
                 ):
                     break
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(
+                1
+            )
 
         await inspect_page_for_hls(
             page,
             discovered,
         )
 
-        if not discovered:
+        # ----------------------------------------------------
+        # Stop before recording
+        # ----------------------------------------------------
+
+        if await check_stop():
+
             log(
-                "[HLS] No HLS playlist discovered."
+                "[STOP] Stop requested "
+                "before recording began."
+            )
+
+            await browser.close()
+
+            await send_message(
+                f"⏹️ تم إيقاف التسجيل "
+                f"#{RECORD_ID} قبل بدء "
+                "تسجيل المقاطع."
+            )
+
+            return 0
+
+        # ----------------------------------------------------
+        # No HLS
+        # ----------------------------------------------------
+
+        if not discovered:
+
+            log(
+                "[HLS] No HLS playlist "
+                "discovered."
             )
 
             await send_message(
@@ -1118,15 +1728,16 @@ async def main():
             )
 
             await browser.close()
+
             return 1
 
         log(
-            f"[HLS] Total discovered URLs: "
+            "[HLS] Total discovered URLs: "
             f"{len(discovered)}"
         )
 
         # ----------------------------------------------------
-        # Find a usable media playlist USING BROWSER SESSION
+        # Find usable playlist
         # ----------------------------------------------------
 
         playlist_url, playlist = (
@@ -1136,114 +1747,213 @@ async def main():
             )
         )
 
-        if not playlist_url or not playlist:
+        if (
+            not playlist_url
+            or not playlist
+        ):
+
+            if await check_stop():
+
+                await browser.close()
+
+                await send_message(
+                    f"⏹️ تم إيقاف التسجيل "
+                    f"#{RECORD_ID}."
+                )
+
+                return 0
+
             log(
-                "[HLS] Discovered URLs were not usable "
+                "[HLS] Discovered URLs "
+                "were not usable "
                 "media playlists."
             )
 
             await send_message(
-                "❌ تم اكتشاف HLS لكن تعذر الوصول "
-                "إلى قائمة المقاطع الخاصة بالبث."
+                "❌ تم اكتشاف HLS لكن "
+                "تعذر الوصول إلى قائمة "
+                "المقاطع الخاصة بالبث."
             )
 
             await browser.close()
+
             return 1
 
         log(
-            f"[HLS] Recording playlist: "
+            "[HLS] Recording playlist: "
             f"{playlist_url}"
         )
 
         # ----------------------------------------------------
-        # Build browser session headers
+        # Browser session headers
         # ----------------------------------------------------
 
-        headers = await build_browser_session(
-            page,
-            context,
+        headers = (
+            await build_browser_session(
+                page,
+                context,
+            )
         )
 
         # ----------------------------------------------------
         # Record
         # ----------------------------------------------------
 
-        segment_files = await record_hls(
-            context,
-            page,
-            playlist_url,
-            playlist,
-            headers,
+        segment_files = (
+            await record_hls(
+                context,
+                page,
+                playlist_url,
+                playlist,
+                headers,
+            )
         )
 
-        await browser.close()
+        # ----------------------------------------------------
+        # Close browser
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+    # ========================================================
     # Finalize
-    # --------------------------------------------------------
+    # ========================================================
 
     log(
-        "Stopping recorder and preparing final MP4..."
+        "Stopping recorder and "
+        "preparing final MP4..."
     )
 
+    # --------------------------------------------------------
+    # No segments
+    # --------------------------------------------------------
+
     if not segment_files:
+
         log(
             "[MUX] No recorded segments."
         )
 
-        await send_message(
-            "❌ لم يتم تسجيل أي جزء من البث."
-        )
+        if stop_requested:
+
+            await send_message(
+                f"⏹️ تم إيقاف التسجيل "
+                f"#{RECORD_ID}، لكن لم "
+                "يتم تسجيل أي مقطع."
+            )
+
+        else:
+
+            await send_message(
+                "❌ لم يتم تسجيل أي جزء من البث."
+            )
 
         return 0
+
+    # --------------------------------------------------------
+    # Mux
+    # --------------------------------------------------------
 
     output_file = mux_segments(
         segment_files
     )
 
     if not output_file:
+
         await send_message(
-            "❌ فشل إنشاء ملف MP4 بعد انتهاء التسجيل."
+            "❌ فشل إنشاء ملف MP4 بعد "
+            "انتهاء التسجيل."
         )
 
         return 1
 
-    await send_video(
+    # --------------------------------------------------------
+    # Upload
+    # --------------------------------------------------------
+
+    uploaded = await send_video(
         output_file
     )
 
-    await send_message(
-        f"✅ انتهى التسجيل #{RECORD_ID}."
-    )
+    if uploaded:
+
+        if stop_requested:
+
+            await send_message(
+                f"⏹️ تم إيقاف التسجيل "
+                f"#{RECORD_ID} وإرسال "
+                "الملف بنجاح."
+            )
+
+        else:
+
+            await send_message(
+                f"✅ انتهى التسجيل "
+                f"#{RECORD_ID}."
+            )
+
+    else:
+
+        await send_message(
+            f"⚠️ انتهى التسجيل "
+            f"#{RECORD_ID}، لكن تعذر "
+            "إرسال ملف MP4 إلى Telegram."
+        )
+
+        return 1
+
+    # --------------------------------------------------------
+    # Keep output for a short period.
+    # The GitHub runner will clean the workspace.
+    # --------------------------------------------------------
 
     return 0
 
 
+# ============================================================
+# Entrypoint
+# ============================================================
+
 if __name__ == "__main__":
+
     try:
+
         exit_code = asyncio.run(
             main()
         )
 
-        sys.exit(exit_code)
+        sys.exit(
+            exit_code
+        )
 
     except KeyboardInterrupt:
+
         log(
             "[STOP] Keyboard interrupt."
         )
+
         sys.exit(0)
 
     except Exception as exc:
+
         log(
-            f"[FATAL] {type(exc).__name__}: {exc}"
+            "[FATAL] "
+            f"{type(exc).__name__}: "
+            f"{exc}"
         )
 
         try:
+
             asyncio.run(
                 send_message(
-                    "❌ حدث خطأ غير متوقع أثناء التسجيل."
+                    "❌ حدث خطأ غير متوقع "
+                    "أثناء التسجيل."
                 )
             )
+
         except Exception:
             pass
 
