@@ -42,12 +42,11 @@ PAGE_URL = (
     else ""
 )
 
-# Telegram Bot API has a practical upload limit around 50 MB
-# for sendVideo. We intentionally stay below it.
+# Telegram Bot API upload safety limit.
+# We stay comfortably below 50 MB.
 TELEGRAM_MAX_MB = 49
 
-# Use a little extra safety margin so that the final MP4
-# remains comfortably below Telegram's limit.
+# Target size for each generated MP4 part.
 PART_TARGET_MB = 47
 
 PART_TARGET_BYTES = (
@@ -1527,6 +1526,31 @@ def mux_part(
             return None
 
         if not part_file.exists():
+
+            log(
+                "[PART] FFmpeg completed but "
+                "output file does not exist: "
+                f"{part_file}"
+            )
+
+            return None
+
+        size = part_file.stat().st_size
+
+        if size <= 0:
+
+            log(
+                "[PART] Output file is empty: "
+                f"{part_file}"
+            )
+
+            try:
+                part_file.unlink(
+                    missing_ok=True
+                )
+            except Exception:
+                pass
+
             return None
 
         return part_file
@@ -1539,6 +1563,13 @@ def mux_part(
             f"{exc}"
         )
 
+        try:
+            part_file.unlink(
+                missing_ok=True
+            )
+        except Exception:
+            pass
+
         return None
 
 
@@ -1548,22 +1579,44 @@ def split_recording_into_parts(
     """
     Splits the recorded TS segments into valid MP4 files.
 
-    Important:
-    We do NOT split an MP4 at arbitrary byte offsets.
-    Instead, each part is independently muxed from complete
-    HLS segments. This keeps every part playable as a video.
+    The split is performed only between complete HLS segments.
+    No arbitrary byte splitting is used.
 
-    The video stream is copied with -c copy, so there is no
-    video re-encoding or intentional quality loss.
+    Video/audio are copied with -c copy.
+    No re-encoding is performed.
+
+    The algorithm first estimates groups using the TS byte sizes,
+    then muxes each group and verifies the actual MP4 size.
+
+    If a resulting MP4 is still too large, that group is divided
+    recursively until the resulting parts fit the target.
+
+    This avoids the previous O(n²) behaviour where FFmpeg was
+    repeatedly muxing the same growing Part hundreds of times.
     """
 
     if not segment_files:
         return []
 
-    total_bytes = sum(
-        path.stat().st_size
+    valid_segments = [
+        path
         for path in segment_files
         if path.exists()
+        and path.is_file()
+        and path.stat().st_size > 0
+    ]
+
+    if not valid_segments:
+
+        log(
+            "[PARTS] No valid segment files."
+        )
+
+        return []
+
+    total_bytes = sum(
+        path.stat().st_size
+        for path in valid_segments
     )
 
     total_mb = (
@@ -1577,216 +1630,402 @@ def split_recording_into_parts(
         f"{total_mb:.2f} MB"
     )
 
-    # If the entire recording is already small,
-    # create one MP4 only.
-    if total_mb <= PART_TARGET_MB:
+    # --------------------------------------------------------
+    # If recording is already small enough,
+    # the normal complete MP4 will be sent.
+    # --------------------------------------------------------
+
+    if total_mb < TELEGRAM_MAX_MB:
+
         log(
-            "[PARTS] Recording is already "
-            "small enough for one video."
+            "[PARTS] Recording is small enough "
+            "for one Telegram video."
         )
 
         return []
 
     log(
-        "[PARTS] Large recording detected. "
-        f"Target per part: {PART_TARGET_MB} MB"
+        "[PARTS] Large recording detected."
     )
+
+    log(
+        "[PARTS] Target per part: "
+        f"{PART_TARGET_MB} MB"
+    )
+
+    # --------------------------------------------------------
+    # Clean old generated parts.
+    # --------------------------------------------------------
 
     PARTS_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    # Remove old generated parts.
     for old_file in PARTS_DIR.glob(
         "*.mp4"
     ):
+
         try:
             old_file.unlink()
+        except Exception as exc:
+            log(
+                "[PARTS] Could not remove old "
+                f"part {old_file}: {exc}"
+            )
+
+    # --------------------------------------------------------
+    # Estimate groups using TS size.
+    #
+    # We intentionally use 90% of the MP4 target because
+    # MP4 container overhead can make the final MP4 slightly
+    # larger than the raw TS total.
+    # --------------------------------------------------------
+
+    ESTIMATE_TARGET_BYTES = int(
+        PART_TARGET_BYTES * 0.90
+    )
+
+    groups = []
+
+    current_group = []
+    current_bytes = 0
+
+    for segment in valid_segments:
+
+        segment_size = (
+            segment.stat().st_size
+        )
+
+        if (
+            current_group
+            and
+            current_bytes
+            + segment_size
+            > ESTIMATE_TARGET_BYTES
+        ):
+
+            groups.append(
+                current_group
+            )
+
+            current_group = []
+            current_bytes = 0
+
+        current_group.append(
+            segment
+        )
+
+        current_bytes += (
+            segment_size
+        )
+
+    if current_group:
+        groups.append(
+            current_group
+        )
+
+    log(
+        "[PARTS] Initial estimated groups: "
+        f"{len(groups)}"
+    )
+
+    # --------------------------------------------------------
+    # Each verified item:
+    #
+    #     (Path, size)
+    #
+    # Recursive verification can split a group further.
+    # --------------------------------------------------------
+
+    verified_groups = []
+
+    def verify_group(
+        group,
+        part_number_hint,
+    ):
+        if not group:
+            return
+
+        # ----------------------------------------------------
+        # One segment only.
+        # ----------------------------------------------------
+
+        if len(group) == 1:
+
+            part_file = mux_part(
+                group,
+                part_number_hint,
+            )
+
+            if part_file is None:
+
+                raise RuntimeError(
+                    "Failed to mux a single "
+                    "HLS segment."
+                )
+
+            size = (
+                part_file.stat().st_size
+            )
+
+            size_mb = (
+                size
+                / 1024
+                / 1024
+            )
+
+            log(
+                "[PARTS] Single-segment Part "
+                f"{part_number_hint}: "
+                f"{size_mb:.2f} MB"
+            )
+
+            if size < TELEGRAM_MAX_MB:
+
+                verified_groups.append(
+                    (
+                        part_file,
+                        size,
+                    )
+                )
+
+                return
+
+            # A single HLS segment larger than
+            # Telegram's limit cannot be safely
+            # split without re-encoding.
+            raise RuntimeError(
+                "A single HLS segment produced "
+                f"a {size_mb:.2f} MB MP4, which "
+                "is too large for Telegram."
+            )
+
+        # ----------------------------------------------------
+        # Try the whole group once.
+        # ----------------------------------------------------
+
+        part_file = mux_part(
+            group,
+            part_number_hint,
+        )
+
+        if part_file is None:
+
+            raise RuntimeError(
+                f"Failed to mux Part "
+                f"{part_number_hint}."
+            )
+
+        size = (
+            part_file.stat().st_size
+        )
+
+        size_mb = (
+            size
+            / 1024
+            / 1024
+        )
+
+        log(
+            "[PARTS] Verified candidate "
+            f"Part {part_number_hint}: "
+            f"{size_mb:.2f} MB "
+            f"({len(group)} segments)"
+        )
+
+        # ----------------------------------------------------
+        # Fits safely.
+        # ----------------------------------------------------
+
+        if size < PART_TARGET_BYTES:
+
+            verified_groups.append(
+                (
+                    part_file,
+                    size,
+                )
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Too large.
+        #
+        # Remove oversized temporary MP4 before splitting
+        # the group into smaller groups.
+        # ----------------------------------------------------
+
+        try:
+            part_file.unlink(
+                missing_ok=True
+            )
         except Exception:
             pass
 
-    parts = []
+        middle = len(group) // 2
 
-    current_index = 0
-    part_number = 1
-    total_segments = len(
-        segment_files
-    )
+        left = group[:middle]
+        right = group[middle:]
 
-    while current_index < total_segments:
+        log(
+            "[PARTS] Part "
+            f"{part_number_hint} is too large "
+            f"({size_mb:.2f} MB). "
+            f"Splitting {len(group)} segments "
+            f"into {len(left)} + {len(right)}."
+        )
 
-        if stop_requested:
-            log(
-                "[PARTS] Stop flag detected "
-                "during part generation."
-            )
+        verify_group(
+            left,
+            part_number_hint,
+        )
 
-        best_part_file = None
-        best_end_index = current_index
+        # Use the number of already-created verified parts
+        # so temporary filenames remain unique.
+        next_hint = (
+            len(verified_groups) + 1
+        )
 
-        candidate_files = []
+        verify_group(
+            right,
+            next_hint,
+        )
 
-        index = current_index
+    # --------------------------------------------------------
+    # Verify all initial groups.
+    # --------------------------------------------------------
 
-        while index < total_segments:
+    try:
 
-            candidate_files.append(
-                segment_files[index]
-            )
+        for group in groups:
 
-            candidate_part = mux_part(
-                candidate_files,
-                part_number,
-            )
+            if stop_requested:
 
-            if candidate_part is None:
-
-                # If the candidate could not be muxed,
-                # stop this part attempt.
-                candidate_files.pop()
-
-                break
-
-            candidate_size = (
-                candidate_part.stat().st_size
-            )
-
-            candidate_mb = (
-                candidate_size
-                / 1024
-                / 1024
-            )
-
-            log(
-                "[PARTS] Candidate Part "
-                f"{part_number}: "
-                f"{candidate_mb:.2f} MB "
-                f"({len(candidate_files)} segments)"
-            )
-
-            if (
-                candidate_size
-                <= PART_TARGET_BYTES
-            ):
-
-                # This candidate fits.
-                if best_part_file is not None:
-                    try:
-                        best_part_file.unlink(
-                            missing_ok=True
-                        )
-                    except Exception:
-                        pass
-
-                best_part_file = (
-                    candidate_part
+                log(
+                    "[PARTS] Stop flag detected "
+                    "during part generation."
                 )
 
-                best_end_index = (
-                    index + 1
-                )
+            hint = (
+                len(verified_groups) + 1
+            )
 
-                index += 1
+            verify_group(
+                group,
+                hint,
+            )
 
-                continue
+    except Exception as exc:
 
-            # ------------------------------------------------
-            # Candidate is too large.
-            # ------------------------------------------------
+        log(
+            "[PARTS] Fatal error while "
+            f"creating parts: {exc}"
+        )
+
+        # Clean all generated parts.
+        for part_file, _ in (
+            verified_groups
+        ):
 
             try:
-                candidate_part.unlink(
+                part_file.unlink(
                     missing_ok=True
                 )
             except Exception:
                 pass
 
-            # Remove the segment that made it too large.
-            candidate_files.pop()
+        return []
 
-            break
+    # --------------------------------------------------------
+    # Normalize filenames sequentially.
+    # --------------------------------------------------------
 
-        # ----------------------------------------------------
-        # Safety: one HLS segment itself can theoretically be
-        # larger than our target.
-        # ----------------------------------------------------
+    final_parts = []
 
-        if best_part_file is None:
+    for index, (
+        old_file,
+        size,
+    ) in enumerate(
+        verified_groups,
+        start=1,
+    ):
 
-            log(
-                "[PARTS] A single HLS segment "
-                "is larger than the target. "
-                "Creating the smallest possible "
-                "valid MP4 part."
+        final_name = (
+            PARTS_DIR
+            / (
+                f"{safe_filename(RECORD_ID)}"
+                f"_part_{index:03d}.mp4"
             )
+        )
 
-            single_segment = [
-                segment_files[
-                    current_index
-                ]
-            ]
+        try:
 
-            best_part_file = mux_part(
-                single_segment,
-                part_number,
-            )
+            if old_file != final_name:
 
-            if best_part_file is None:
+                if final_name.exists():
 
-                log(
-                    "[PARTS] Failed to create "
-                    f"Part {part_number}."
+                    final_name.unlink()
+
+                old_file.rename(
+                    final_name
                 )
 
-                return parts
+            if not final_name.exists():
 
-            best_end_index = (
-                current_index + 1
-            )
+                log(
+                    "[PARTS] Final part does not "
+                    "exist after rename: "
+                    f"{final_name}"
+                )
 
-            actual_size = (
-                best_part_file.stat().st_size
-                / 1024
-                / 1024
-            )
-
-            log(
-                "[PARTS] Part "
-                f"{part_number}: "
-                f"{actual_size:.2f} MB"
-            )
-
-        else:
+                return []
 
             final_size = (
-                best_part_file.stat().st_size
+                final_name.stat().st_size
                 / 1024
                 / 1024
+            )
+
+            # Absolute safety check.
+            if (
+                final_size
+                >= TELEGRAM_MAX_MB
+            ):
+
+                log(
+                    "[PARTS] SAFETY CHECK FAILED: "
+                    f"{final_name.name} = "
+                    f"{final_size:.2f} MB"
+                )
+
+                return []
+
+            final_parts.append(
+                final_name
             )
 
             log(
                 "[PARTS] Final Part "
-                f"{part_number}: "
+                f"{index}: "
                 f"{final_size:.2f} MB"
             )
 
-        parts.append(
-            best_part_file
-        )
+        except Exception as exc:
 
-        current_index = (
-            best_end_index
-        )
+            log(
+                "[PARTS] Failed to finalize "
+                f"Part {index}: {exc}"
+            )
 
-        part_number += 1
+            return []
 
     log(
-        "[PARTS] Created "
-        f"{len(parts)} video part(s)."
+        "[PARTS] Successfully created "
+        f"{len(final_parts)} video part(s)."
     )
 
-    return parts
+    return final_parts
 
 
 # ============================================================
@@ -1802,9 +2041,11 @@ async def send_video_file(
         return False
 
     if not file_path.exists():
+
         log(
             "[TELEGRAM] Output file does "
-            "not exist."
+            "not exist: "
+            f"{file_path}"
         )
 
         return False
@@ -1839,6 +2080,7 @@ async def send_video_file(
         )
 
         if total_parts is not None:
+
             caption += (
                 f" / {total_parts}"
             )
@@ -1923,6 +2165,16 @@ async def send_recording(
     if not output_file:
         return False
 
+    if not output_file.exists():
+
+        log(
+            "[TELEGRAM] Final MP4 does not "
+            "exist: "
+            f"{output_file}"
+        )
+
+        return False
+
     full_size_mb = (
         output_file.stat().st_size
         / 1024
@@ -1935,7 +2187,7 @@ async def send_recording(
     )
 
     # --------------------------------------------------------
-    # Small enough: send one video
+    # Small enough: send one video.
     # --------------------------------------------------------
 
     if full_size_mb < TELEGRAM_MAX_MB:
@@ -1956,7 +2208,7 @@ async def send_recording(
         return False
 
     # --------------------------------------------------------
-    # Large recording
+    # Large recording.
     # --------------------------------------------------------
 
     await send_message(
@@ -1998,7 +2250,19 @@ async def send_recording(
     ):
 
         if not part_file.exists():
+
+            log(
+                "[TELEGRAM] Part is missing: "
+                f"{part_file}"
+            )
+
             all_uploaded = False
+
+            await send_message(
+                f"⚠️ الجزء {index} من "
+                f"{total_parts} غير موجود."
+            )
+
             continue
 
         size_mb = (
@@ -2426,7 +2690,7 @@ async def main():
         return 1
 
     # --------------------------------------------------------
-    # GitHub runner cleans workspace
+    # GitHub runner cleans workspace.
     # --------------------------------------------------------
 
     return 0
