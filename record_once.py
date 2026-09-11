@@ -42,19 +42,27 @@ PAGE_URL = (
     else ""
 )
 
+# Telegram Bot API has a practical upload limit around 50 MB
+# for sendVideo. We intentionally stay below it.
 TELEGRAM_MAX_MB = 49
+
+# Use a little extra safety margin so that the final MP4
+# remains comfortably below Telegram's limit.
+PART_TARGET_MB = 47
+
+PART_TARGET_BYTES = (
+    PART_TARGET_MB
+    * 1024
+    * 1024
+)
 
 DISCOVERY_TIMEOUT = 30
 PLAYLIST_TIMEOUT = 20
 SEGMENT_TIMEOUT = 30
 
-# Check stop signal frequently.
 STOP_CHECK_INTERVAL = 2.0
-
-# How long to wait between playlist refreshes.
 PLAYLIST_POLL_INTERVAL = 2.0
 
-# GitHub stop-file API path.
 STOP_FILE = (
     f".recorder/stop/{RECORD_ID}"
 )
@@ -62,6 +70,7 @@ STOP_FILE = (
 WORK_DIR = Path("recording_work")
 SEGMENTS_DIR = WORK_DIR / "segments"
 OUTPUT_DIR = WORK_DIR / "output"
+PARTS_DIR = OUTPUT_DIR / "parts"
 
 stop_requested = False
 
@@ -112,6 +121,7 @@ async def telegram_request(
     method,
     data=None,
     file_data=None,
+    file_name=None,
 ):
     if not BOT_TOKEN:
         log(
@@ -150,7 +160,10 @@ async def telegram_request(
                 form.add_field(
                     "video",
                     file_data,
-                    filename=f"{RECORD_ID}.mp4",
+                    filename=(
+                        file_name
+                        or f"{RECORD_ID}.mp4"
+                    ),
                     content_type="video/mp4",
                 )
 
@@ -169,7 +182,7 @@ async def telegram_request(
                     if response.status != 200:
                         log(
                             f"[TELEGRAM] Response: "
-                            f"{text[:2000]}"
+                            f"{text[:3000]}"
                         )
 
                     return (
@@ -192,7 +205,7 @@ async def telegram_request(
                 if response.status != 200:
                     log(
                         f"[TELEGRAM] Response: "
-                        f"{text[:2000]}"
+                        f"{text[:3000]}"
                     )
 
                 return (
@@ -231,8 +244,6 @@ async def github_stop_requested():
 
         .recorder/stop/{RECORD_ID}
 
-    The file is created by the Cloudflare Worker.
-
     Accepted stop-file formats:
 
     1. JSON:
@@ -241,10 +252,9 @@ async def github_stop_requested():
          "stop": true
        }
 
-    2. Any non-empty file containing the exact
-       RECORD_ID and/or the word "stop".
+    2. Tolerant plain text.
 
-    This makes the stop mechanism more tolerant.
+    3. Any non-empty record-specific stop file.
     """
 
     if not GITHUB_TOKEN:
@@ -329,7 +339,7 @@ async def github_stop_requested():
                 raw_stripped = raw.strip()
 
                 # ------------------------------------------------
-                # First: try JSON
+                # JSON
                 # ------------------------------------------------
 
                 try:
@@ -365,7 +375,7 @@ async def github_stop_requested():
                     pass
 
                 # ------------------------------------------------
-                # Second: tolerant plain-text detection
+                # Plain text
                 # ------------------------------------------------
 
                 lower = raw_stripped.lower()
@@ -391,9 +401,10 @@ async def github_stop_requested():
                     )
                     return True
 
-                # If the exact record-specific stop file exists,
-                # treat it as a stop signal even if its contents
-                # are unusual.
+                # ------------------------------------------------
+                # Existing non-empty record-specific file
+                # ------------------------------------------------
+
                 if raw_stripped:
                     log(
                         "[STOP] Stop file exists for "
@@ -1064,16 +1075,8 @@ async def record_hls(
 
         while not stop_requested:
 
-            # ------------------------------------------------
-            # Stop check BEFORE playlist request
-            # ------------------------------------------------
-
             if await check_stop():
                 break
-
-            # ------------------------------------------------
-            # Refresh browser session
-            # ------------------------------------------------
 
             try:
 
@@ -1095,10 +1098,6 @@ async def record_hls(
                     "refresh headers: "
                     f"{exc}"
                 )
-
-            # ------------------------------------------------
-            # Fetch playlist
-            # ------------------------------------------------
 
             playlist_text, status = (
                 await browser_get_playlist(
@@ -1278,10 +1277,6 @@ async def record_hls(
                         f"{segment_url}"
                     )
 
-            # ------------------------------------------------
-            # Immediate stop check after downloading
-            # ------------------------------------------------
-
             if await check_stop():
                 break
 
@@ -1304,10 +1299,16 @@ async def record_hls(
 
 def create_concat_file(
     segment_files,
+    filename="segments.txt",
 ):
+    WORK_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     concat_file = (
         WORK_DIR
-        / "segments.txt"
+        / filename
     )
 
     with concat_file.open(
@@ -1440,11 +1441,362 @@ def mux_segments(
 
 
 # ============================================================
+# Split large MP4 into valid MP4 video parts
+# ============================================================
+
+def mux_part(
+    segment_files,
+    part_number,
+):
+    """
+    Creates one valid MP4 from a group of TS segments.
+
+    No video re-encoding is performed.
+    """
+
+    if not segment_files:
+        return None
+
+    PARTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    part_file = (
+        PARTS_DIR
+        / (
+            f"{safe_filename(RECORD_ID)}"
+            f"_part_{part_number:03d}.mp4"
+        )
+    )
+
+    concat_name = (
+        f"part_{part_number:03d}.txt"
+    )
+
+    concat_file = create_concat_file(
+        segment_files,
+        concat_name,
+    )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_file),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(part_file),
+    ]
+
+    try:
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+
+            log(
+                "[PART] FFmpeg failed for "
+                f"Part {part_number}:"
+            )
+
+            log(
+                result.stderr[-3000:]
+            )
+
+            try:
+                part_file.unlink(
+                    missing_ok=True
+                )
+            except Exception:
+                pass
+
+            return None
+
+        if not part_file.exists():
+            return None
+
+        return part_file
+
+    except Exception as exc:
+
+        log(
+            "[PART] Exception while "
+            f"creating Part {part_number}: "
+            f"{exc}"
+        )
+
+        return None
+
+
+def split_recording_into_parts(
+    segment_files,
+):
+    """
+    Splits the recorded TS segments into valid MP4 files.
+
+    Important:
+    We do NOT split an MP4 at arbitrary byte offsets.
+    Instead, each part is independently muxed from complete
+    HLS segments. This keeps every part playable as a video.
+
+    The video stream is copied with -c copy, so there is no
+    video re-encoding or intentional quality loss.
+    """
+
+    if not segment_files:
+        return []
+
+    total_bytes = sum(
+        path.stat().st_size
+        for path in segment_files
+        if path.exists()
+    )
+
+    total_mb = (
+        total_bytes
+        / 1024
+        / 1024
+    )
+
+    log(
+        "[PARTS] Recorded TS data: "
+        f"{total_mb:.2f} MB"
+    )
+
+    # If the entire recording is already small,
+    # create one MP4 only.
+    if total_mb <= PART_TARGET_MB:
+        log(
+            "[PARTS] Recording is already "
+            "small enough for one video."
+        )
+
+        return []
+
+    log(
+        "[PARTS] Large recording detected. "
+        f"Target per part: {PART_TARGET_MB} MB"
+    )
+
+    PARTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # Remove old generated parts.
+    for old_file in PARTS_DIR.glob(
+        "*.mp4"
+    ):
+        try:
+            old_file.unlink()
+        except Exception:
+            pass
+
+    parts = []
+
+    current_index = 0
+    part_number = 1
+    total_segments = len(
+        segment_files
+    )
+
+    while current_index < total_segments:
+
+        if stop_requested:
+            log(
+                "[PARTS] Stop flag detected "
+                "during part generation."
+            )
+
+        best_part_file = None
+        best_end_index = current_index
+
+        candidate_files = []
+
+        index = current_index
+
+        while index < total_segments:
+
+            candidate_files.append(
+                segment_files[index]
+            )
+
+            candidate_part = mux_part(
+                candidate_files,
+                part_number,
+            )
+
+            if candidate_part is None:
+
+                # If the candidate could not be muxed,
+                # stop this part attempt.
+                candidate_files.pop()
+
+                break
+
+            candidate_size = (
+                candidate_part.stat().st_size
+            )
+
+            candidate_mb = (
+                candidate_size
+                / 1024
+                / 1024
+            )
+
+            log(
+                "[PARTS] Candidate Part "
+                f"{part_number}: "
+                f"{candidate_mb:.2f} MB "
+                f"({len(candidate_files)} segments)"
+            )
+
+            if (
+                candidate_size
+                <= PART_TARGET_BYTES
+            ):
+
+                # This candidate fits.
+                if best_part_file is not None:
+                    try:
+                        best_part_file.unlink(
+                            missing_ok=True
+                        )
+                    except Exception:
+                        pass
+
+                best_part_file = (
+                    candidate_part
+                )
+
+                best_end_index = (
+                    index + 1
+                )
+
+                index += 1
+
+                continue
+
+            # ------------------------------------------------
+            # Candidate is too large.
+            # ------------------------------------------------
+
+            try:
+                candidate_part.unlink(
+                    missing_ok=True
+                )
+            except Exception:
+                pass
+
+            # Remove the segment that made it too large.
+            candidate_files.pop()
+
+            break
+
+        # ----------------------------------------------------
+        # Safety: one HLS segment itself can theoretically be
+        # larger than our target.
+        # ----------------------------------------------------
+
+        if best_part_file is None:
+
+            log(
+                "[PARTS] A single HLS segment "
+                "is larger than the target. "
+                "Creating the smallest possible "
+                "valid MP4 part."
+            )
+
+            single_segment = [
+                segment_files[
+                    current_index
+                ]
+            ]
+
+            best_part_file = mux_part(
+                single_segment,
+                part_number,
+            )
+
+            if best_part_file is None:
+
+                log(
+                    "[PARTS] Failed to create "
+                    f"Part {part_number}."
+                )
+
+                return parts
+
+            best_end_index = (
+                current_index + 1
+            )
+
+            actual_size = (
+                best_part_file.stat().st_size
+                / 1024
+                / 1024
+            )
+
+            log(
+                "[PARTS] Part "
+                f"{part_number}: "
+                f"{actual_size:.2f} MB"
+            )
+
+        else:
+
+            final_size = (
+                best_part_file.stat().st_size
+                / 1024
+                / 1024
+            )
+
+            log(
+                "[PARTS] Final Part "
+                f"{part_number}: "
+                f"{final_size:.2f} MB"
+            )
+
+        parts.append(
+            best_part_file
+        )
+
+        current_index = (
+            best_end_index
+        )
+
+        part_number += 1
+
+    log(
+        "[PARTS] Created "
+        f"{len(parts)} video part(s)."
+    )
+
+    return parts
+
+
+# ============================================================
 # Telegram upload
 # ============================================================
 
-async def send_video(
+async def send_video_file(
     file_path,
+    part_number=None,
+    total_parts=None,
 ):
     if not file_path:
         return False
@@ -1464,28 +1816,46 @@ async def send_video(
     )
 
     log(
-        "[TELEGRAM] Final MP4 size: "
+        "[TELEGRAM] Video size: "
         f"{size_mb:.2f} MB"
     )
 
-    if size_mb > TELEGRAM_MAX_MB:
+    if size_mb >= TELEGRAM_MAX_MB:
 
-        await send_message(
-            "⚠️ انتهى التسجيل، لكن حجم "
-            "ملف MP4 "
-            f"({size_mb:.1f} MB) "
-            "أكبر من الحد المسموح."
+        log(
+            "[TELEGRAM] Refusing to upload "
+            "a file too close to/over the "
+            "Telegram limit: "
+            f"{size_mb:.2f} MB"
         )
 
         return False
 
-    await send_message(
-        f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
-        f"📦 الحجم: {size_mb:.1f} MB\n"
-        "📤 جارٍ إرسال الملف..."
-    )
+    if part_number is not None:
+
+        caption = (
+            f"🎥 التسجيل #{RECORD_ID}\n"
+            f"Part {part_number}"
+        )
+
+        if total_parts is not None:
+            caption += (
+                f" / {total_parts}"
+            )
+
+    else:
+
+        caption = (
+            f"🎥 Recording "
+            f"#{RECORD_ID}"
+        )
 
     try:
+
+        log(
+            "[TELEGRAM] Uploading video: "
+            f"{file_path.name}"
+        )
 
         with file_path.open(
             "rb"
@@ -1496,15 +1866,13 @@ async def send_video(
                     "sendVideo",
                     data={
                         "chat_id": ADMIN_USER_ID,
-                        "caption": (
-                            f"🎥 Recording "
-                            f"#{RECORD_ID}"
-                        ),
+                        "caption": caption,
                         "supports_streaming": (
                             "true"
                         ),
                     },
                     file_data=file,
+                    file_name=file_path.name,
                 )
             )
 
@@ -1515,10 +1883,17 @@ async def send_video(
 
             log(
                 "[TELEGRAM] Video uploaded "
-                "successfully."
+                "successfully: "
+                f"{file_path.name}"
             )
 
             return True
+
+        log(
+            "[TELEGRAM] Video upload "
+            "failed: "
+            f"{file_path.name}"
+        )
 
     except Exception as exc:
 
@@ -1528,6 +1903,152 @@ async def send_video(
         )
 
     return False
+
+
+async def send_recording(
+    output_file,
+    segment_files,
+):
+    """
+    Sends the recording to Telegram.
+
+    Small recording:
+        one MP4 video.
+
+    Large recording:
+        multiple valid MP4 videos,
+        each comfortably below 49 MB.
+    """
+
+    if not output_file:
+        return False
+
+    full_size_mb = (
+        output_file.stat().st_size
+        / 1024
+        / 1024
+    )
+
+    log(
+        "[TELEGRAM] Final MP4 size: "
+        f"{full_size_mb:.2f} MB"
+    )
+
+    # --------------------------------------------------------
+    # Small enough: send one video
+    # --------------------------------------------------------
+
+    if full_size_mb < TELEGRAM_MAX_MB:
+
+        await send_message(
+            f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
+            f"📦 الحجم: {full_size_mb:.1f} MB\n"
+            "📤 جارٍ إرسال الفيديو..."
+        )
+
+        uploaded = await send_video_file(
+            output_file
+        )
+
+        if uploaded:
+            return True
+
+        return False
+
+    # --------------------------------------------------------
+    # Large recording
+    # --------------------------------------------------------
+
+    await send_message(
+        f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
+        f"📦 الحجم الكامل: {full_size_mb:.1f} MB\n"
+        "✂️ الملف كبير، سيتم تقسيمه "
+        "إلى عدة فيديوهات وإرسالها "
+        "بالترتيب..."
+    )
+
+    parts = (
+        split_recording_into_parts(
+            segment_files
+        )
+    )
+
+    if not parts:
+
+        await send_message(
+            "❌ تعذر تقسيم التسجيل "
+            "إلى أجزاء قابلة للإرسال."
+        )
+
+        return False
+
+    total_parts = len(parts)
+
+    await send_message(
+        f"📤 سيتم إرسال "
+        f"{total_parts} فيديوهات "
+        "بالترتيب."
+    )
+
+    all_uploaded = True
+
+    for index, part_file in enumerate(
+        parts,
+        start=1,
+    ):
+
+        if not part_file.exists():
+            all_uploaded = False
+            continue
+
+        size_mb = (
+            part_file.stat().st_size
+            / 1024
+            / 1024
+        )
+
+        log(
+            "[TELEGRAM] Sending Part "
+            f"{index}/{total_parts}: "
+            f"{size_mb:.2f} MB"
+        )
+
+        uploaded = await send_video_file(
+            part_file,
+            part_number=index,
+            total_parts=total_parts,
+        )
+
+        if not uploaded:
+
+            all_uploaded = False
+
+            await send_message(
+                f"⚠️ تعذر إرسال "
+                f"Part {index} من "
+                f"{total_parts}."
+            )
+
+            # Continue trying the remaining parts.
+            continue
+
+    if all_uploaded:
+
+        await send_message(
+            f"✅ تم إرسال التسجيل "
+            f"#{RECORD_ID} بالكامل "
+            f"في {total_parts} أجزاء."
+        )
+
+    else:
+
+        await send_message(
+            f"⚠️ انتهى إرسال التسجيل "
+            f"#{RECORD_ID}، لكن تعذر "
+            "إرسال جزء أو أكثر."
+        )
+
+    return all_uploaded
 
 
 # ============================================================
@@ -1623,7 +2144,6 @@ async def main():
             except Exception:
                 pass
 
-        # IMPORTANT:
         # Listener MUST exist before goto().
         page.on(
             "response",
@@ -1673,8 +2193,6 @@ async def main():
 
             if discovered:
 
-                # Give player a little more
-                # time to expose live playlist.
                 if (
                     time.time()
                     - discovery_started
@@ -1854,7 +2372,7 @@ async def main():
         return 0
 
     # --------------------------------------------------------
-    # Mux
+    # Create complete MP4
     # --------------------------------------------------------
 
     output_file = mux_segments(
@@ -1871,11 +2389,12 @@ async def main():
         return 1
 
     # --------------------------------------------------------
-    # Upload
+    # Send complete recording / parts
     # --------------------------------------------------------
 
-    uploaded = await send_video(
-        output_file
+    uploaded = await send_recording(
+        output_file,
+        segment_files,
     )
 
     if uploaded:
@@ -1885,14 +2404,15 @@ async def main():
             await send_message(
                 f"⏹️ تم إيقاف التسجيل "
                 f"#{RECORD_ID} وإرسال "
-                "الملف بنجاح."
+                "التسجيل بنجاح."
             )
 
         else:
 
             await send_message(
                 f"✅ انتهى التسجيل "
-                f"#{RECORD_ID}."
+                f"#{RECORD_ID} وتم إرسال "
+                "التسجيل بنجاح."
             )
 
     else:
@@ -1900,14 +2420,13 @@ async def main():
         await send_message(
             f"⚠️ انتهى التسجيل "
             f"#{RECORD_ID}، لكن تعذر "
-            "إرسال ملف MP4 إلى Telegram."
+            "إرسال التسجيل بالكامل."
         )
 
         return 1
 
     # --------------------------------------------------------
-    # Keep output for a short period.
-    # The GitHub runner will clean the workspace.
+    # GitHub runner cleans workspace
     # --------------------------------------------------------
 
     return 0
