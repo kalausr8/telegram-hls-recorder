@@ -1,8 +1,8 @@
 {
   "record_id": "DLT0CG",
   "url": "https://www.tango.me/stream/ort9G7JoMhVy6mysYnFdlw",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 87,
+  "segments_count": 20,
+  "size_mb": 5.54,
   "hls_status": "recording"
 }
