@@ -161,7 +161,7 @@ async def trigger_recording(stream_url, username):
     record_id = generate_record_id()
     body = {
         "event_type": "telegram_record",
-        "client_payload": {
+        client_payload: {
             "url": stream_url,
             "record_id": record_id,
             "username": username
@@ -185,13 +185,14 @@ async def trigger_recording(stream_url, username):
         return False
 
 # ============================================================
-# Playwright Monitor
+# Playwright Monitor (Enhanced Version)
 # ============================================================
 
 async def check_user_live_status(username):
     """
     Use Playwright to check if a user is live.
     Returns (is_live, stream_url) tuple.
+    Enhanced with multiple detection methods.
     """
     profile_url = f"https://www.tango.me/{username}"
     
@@ -219,17 +220,26 @@ async def check_user_live_status(username):
             "is_live": False,
             "stream_url": None,
             "stream_id": None,
+            "detected_urls": [],
         }
         
+        # Method 1: Intercept network responses
         async def handle_response(response):
             try:
                 url = response.url
                 
+                # Log all responses for debugging
+                if "tango" in url.lower() or "m3u8" in url.lower():
+                    log(f"[MONITOR] Network response: {response.status} - {url[:100]}")
+                
                 # Look for Tango's stream watch API
                 if "proxycador/api/public/v1/live/stream/v2/watch" in url:
+                    log(f"[MONITOR] Found Tango watch API: {url}")
                     if response.status == 200:
                         try:
                             data = await response.json()
+                            log(f"[MONITOR] Watch API response: {json.dumps(data)[:500]}")
+                            
                             # Check if response contains stream info
                             if data and "body" in data and "details" in data["body"]:
                                 details = data["body"]["details"]
@@ -238,42 +248,105 @@ async def check_user_live_status(username):
                                     stream_info["is_live"] = True
                                     stream_info["stream_id"] = stream.get("id")
                                     stream_info["stream_url"] = profile_url
-                                    log(f"[MONITOR] Detected live stream for {username}: ID={stream_info['stream_id']}")
+                                    log(f"[MONITOR] ✅ Detected live stream via watch API: ID={stream_info['stream_id']}")
                         except Exception as exc:
-                            log(f"[MONITOR] Error parsing response: {exc}")
+                            log(f"[MONITOR] Error parsing watch API response: {exc}")
                 
-                # Also look for m3u8 URLs in network requests
+                # Look for m3u8 URLs
                 if ".m3u8" in url.lower():
+                    log(f"[MONITOR] ✅ Found m3u8 URL: {url}")
                     if not stream_info["is_live"]:
                         stream_info["is_live"] = True
                         stream_info["stream_url"] = profile_url
-                        log(f"[MONITOR] Detected m3u8 for {username}: {url}")
+                        stream_info["detected_urls"].append(url)
                         
             except Exception as exc:
                 log(f"[MONITOR] Error in response handler: {exc}")
         
+        # Method 2: Intercept network requests
+        async def handle_request(request):
+            try:
+                url = request.url
+                
+                # Log all requests for debugging
+                if "tango" in url.lower() or "m3u8" in url.lower():
+                    log(f"[MONITOR] Network request: {url[:100]}")
+                
+                # Look for m3u8 in requests too
+                if ".m3u8" in url.lower():
+                    log(f"[MONITOR] ✅ Found m3u8 in request: {url}")
+                    if not stream_info["is_live"]:
+                        stream_info["is_live"] = True
+                        stream_info["stream_url"] = profile_url
+                        stream_info["detected_urls"].append(url)
+                        
+            except Exception as exc:
+                log(f"[MONITOR] Error in request handler: {exc}")
+        
         page.on("response", handle_response)
+        page.on("request", handle_request)
         
         try:
             # Navigate to profile page
+            log(f"[MONITOR] Navigating to {profile_url}...")
             await page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
             
             # Wait a bit for dynamic content to load
             await asyncio.sleep(3)
             
-            # Try to find and click play button if exists
+            # Method 3: Check page content for live indicators
+            log("[MONITOR] Checking page content for live indicators...")
             try:
-                play_button = await page.query_selector("button:has-text('Join'), button:has-text('Watch'), [data-testid*='play']")
+                content = await page.content()
+                
+                # Look for common live indicators in HTML
+                live_indicators = [
+                    '"isLive":true',
+                    '"is_live":true',
+                    '"status":"live"',
+                    '"live":true',
+                    'LIVE',
+                    'isLive',
+                    'live-stream',
+                    'm3u8',
+                ]
+                
+                for indicator in live_indicators:
+                    if indicator.lower() in content.lower():
+                        log(f"[MONITOR] ✅ Found live indicator in HTML: {indicator}")
+                        if not stream_info["is_live"]:
+                            stream_info["is_live"] = True
+                            stream_info["stream_url"] = profile_url
+                
+                # Log page title for debugging
+                title = await page.title()
+                log(f"[MONITOR] Page title: {title}")
+                
+            except Exception as exc:
+                log(f"[MONITOR] Error checking page content: {exc}")
+            
+            # Method 4: Try to find and click play button if exists
+            try:
+                log("[MONITOR] Looking for play button...")
+                play_button = await page.query_selector("button:has-text('Join'), button:has-text('Watch'), button:has-text('Play'), [data-testid*='play'], [class*='play']")
                 if play_button:
+                    log("[MONITOR] ✅ Found play button, clicking...")
                     await play_button.click()
                     await asyncio.sleep(3)
-            except Exception:
-                pass
+                else:
+                    log("[MONITOR] No play button found")
+            except Exception as exc:
+                log(f"[MONITOR] Error with play button: {exc}")
             
         except Exception as exc:
             log(f"[MONITOR] Error navigating to {profile_url}: {exc}")
         finally:
             await browser.close()
+        
+        # Log final result
+        log(f"[MONITOR] Final result for {username}: is_live={stream_info['is_live']}, stream_url={stream_info['stream_url']}")
+        if stream_info["detected_urls"]:
+            log(f"[MONITOR] Detected URLs: {stream_info['detected_urls']}")
         
         return stream_info["is_live"], stream_info["stream_url"]
 
@@ -283,7 +356,7 @@ async def check_user_live_status(username):
 
 async def main():
     log("=" * 60)
-    log("Auto-Monitor Started")
+    log("Auto-Monitor Started (Enhanced Version)")
     log("=" * 60)
     
     # Get watchlist
@@ -298,7 +371,7 @@ async def main():
         log("[MONITOR] Watchlist is empty")
         return 0
     
-    log(f"[MONITOR] Found {len(watchlist)} users in watchlist")
+    log(f"[MONITOR] Found {len(watchlist)} users in watchlist: {watchlist}")
     
     # Get currently recording usernames to avoid duplicates
     active_usernames = await github_get_active_usernames()
@@ -324,7 +397,7 @@ async def main():
         is_live, stream_url = await check_user_live_status(username)
         
         if is_live and stream_url:
-            log(f"[MONITOR] {username} is LIVE! Starting recording...")
+            log(f"[MONITOR] ✅ {username} is LIVE! Starting recording...")
             
             # Trigger recording
             success = await trigger_recording(stream_url, username)
@@ -332,7 +405,7 @@ async def main():
                 new_recordings += 1
                 active_usernames.append(username_lower)
         else:
-            log(f"[MONITOR] {username} is OFFLINE")
+            log(f"[MONITOR] ❌ {username} is OFFLINE")
     
     log("=" * 60)
     log(f"Auto-Monitor Completed: {new_recordings} new recording(s) started")
