@@ -161,7 +161,7 @@ async def trigger_recording(stream_url, username):
     record_id = generate_record_id()
     body = {
         "event_type": "telegram_record",
-        client_payload: {
+        "client_payload": {
             "url": stream_url,
             "record_id": record_id,
             "username": username
@@ -228,17 +228,12 @@ async def check_user_live_status(username):
             try:
                 url = response.url
                 
-                # Log all responses for debugging
-                if "tango" in url.lower() or "m3u8" in url.lower():
-                    log(f"[MONITOR] Network response: {response.status} - {url[:100]}")
-                
                 # Look for Tango's stream watch API
                 if "proxycador/api/public/v1/live/stream/v2/watch" in url:
                     log(f"[MONITOR] Found Tango watch API: {url}")
                     if response.status == 200:
                         try:
                             data = await response.json()
-                            log(f"[MONITOR] Watch API response: {json.dumps(data)[:500]}")
                             
                             # Check if response contains stream info
                             if data and "body" in data and "details" in data["body"]:
@@ -267,10 +262,6 @@ async def check_user_live_status(username):
         async def handle_request(request):
             try:
                 url = request.url
-                
-                # Log all requests for debugging
-                if "tango" in url.lower() or "m3u8" in url.lower():
-                    log(f"[MONITOR] Network request: {url[:100]}")
                 
                 # Look for m3u8 in requests too
                 if ".m3u8" in url.lower():
