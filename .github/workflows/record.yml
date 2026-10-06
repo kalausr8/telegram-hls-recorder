@@ -64,5 +64,6 @@ jobs:
           GITHUB_OWNER: kalausr8
           GITHUB_REPO: telegram-hls-recorder
           RECORD_ID: ${{ github.event.client_payload.record_id }}
+          TARGET_USERNAME: ${{ github.event.client_payload.username }}
         run: |
           python record_once.py "${{ github.event.client_payload.url }}"
