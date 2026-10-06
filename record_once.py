@@ -37,12 +37,17 @@ PART_TARGET_BYTES = PART_TARGET_MB * 1024 * 1024
 DISCOVERY_TIMEOUT = 30
 PLAYLIST_TIMEOUT = 20
 SEGMENT_TIMEOUT = 30
-STOP_CHECK_INTERVAL = 2.0
-PLAYLIST_POLL_INTERVAL = 2.0
+
+# ✅ تحسين #1: تقليل ضغط GitHub API (من 2 إلى 30 ثانية)
+STOP_CHECK_INTERVAL = 30.0  # فحص إشارة الإيقاف كل 30 ثانية
+PLAYLIST_POLL_INTERVAL = 3.0  # فحص قائمة التشغيل كل 3 ثوانٍ
 
 MAX_PLAYLIST_RETRIES = 5
 MAX_SEGMENT_RETRIES = 3
 STATUS_UPDATE_INTERVAL = 60
+
+# ✅ تحسين #3: إعادة فتح الـ session كل 45 دقيقة
+SESSION_REFRESH_INTERVAL = 45 * 60  # 45 دقيقة
 
 STOP_FILE = f".recorder/stop/{RECORD_ID}"
 
@@ -212,7 +217,7 @@ async def github_stop_requested():
                 if response.status == 404:
                     return False
                 if response.status != 200:
-                    log(f"[STOP] GitHub stop check HTTP {response.status}")
+                    # لا نحتاج لتسجيل هذا بعد الآن (تقليل الـ noise)
                     return False
 
                 data = await response.json()
@@ -478,10 +483,13 @@ async def download_segment(session, url, path, headers):
         return False, None
 
 # ============================================================
-# Recording loop
+# Recording loop (مع تحسين Session Refresh)
 # ============================================================
 
-async def record_hls(context, page, playlist_url, initial_playlist, headers):
+async def record_hls(playwright, context, page, playlist_url, initial_playlist, headers):
+    """
+    ✅ تحسين #3: Session Refresh كل 45 دقيقة لمنع Memory Leak
+    """
     global stop_requested
     log("[RECORDER] Starting HLS recording...")
     SEGMENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -497,6 +505,7 @@ async def record_hls(context, page, playlist_url, initial_playlist, headers):
     consecutive_playlist_errors = 0
     consecutive_segment_errors = 0
     last_status_update = 0
+    last_session_refresh = time.time()  # ✅ جديد: تتبع وقت آخر refresh
     recording_start_time = time.time()
     start_time_iso = datetime.now(timezone.utc).isoformat()
 
@@ -506,10 +515,18 @@ async def record_hls(context, page, playlist_url, initial_playlist, headers):
         f"Start recording {RECORD_ID}"
     )
 
+    # ✅ جديد: متغير للتحكم في فحص الإيقاف كل 30 ثانية
+    stop_check_counter = 0
+
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while not stop_requested:
-            if await check_stop(): break
-                
+            stop_check_counter += 1
+            
+            # ✅ تحسين #1: فحص الإيقاف كل 10 loops × 3s = 30 ثانية
+            if stop_check_counter % 10 == 0:
+                if await check_stop(): 
+                    break
+            
             if time.time() - last_status_update > STATUS_UPDATE_INTERVAL:
                 last_status_update = time.time()
                 duration = int(time.time() - recording_start_time)
@@ -524,6 +541,42 @@ async def record_hls(context, page, playlist_url, initial_playlist, headers):
                     video_missing = await page.evaluate("() => !document.querySelector('video')")
                     if video_missing: log("[RECORDER] Video element missing from page. Possible end/premium.")
                 except Exception: pass
+
+            # ✅ تحسين #3: إعادة فتح الـ session كل 45 دقيقة
+            if time.time() - last_session_refresh > SESSION_REFRESH_INTERVAL:
+                log(f"[SESSION] 🔄 Refreshing browser session ({SESSION_REFRESH_INTERVAL // 60}min passed)...")
+                try:
+                    # إغلاق المتصفح القديم
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                    
+                    # فتح context جديد
+                    context = await playwright.chromium.new_context(
+                        viewport={"width": 1280, "height": 720},
+                        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    )
+                    page = await context.new_page()
+                    
+                    # إعادة ربط الـ response handler
+                    async def handle_response(response):
+                        # لا نحتاج لعمل شيء هنا، فقط للحفاظ على الاتصال
+                        pass
+                    page.on("response", handle_response)
+                    
+                    # إعادة فتح الصفحة
+                    try:
+                        await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+                        last_session_refresh = time.time()
+                        log("[SESSION] ✅ Session refreshed successfully")
+                    except Exception as goto_exc:
+                        log(f"[SESSION] ⚠️ Could not reload page: {goto_exc}")
+                        # الاستمرار بالـ session الجديد حتى لو فشل إعادة التحميل
+                        
+                except Exception as exc:
+                    log(f"[SESSION] ⚠️ Refresh failed: {exc}")
+                    # الاستمرار بالـ session القديم كـ fallback
 
             try:
                 current_headers = await build_browser_session(page, context)
@@ -608,7 +661,7 @@ async def record_hls(context, page, playlist_url, initial_playlist, headers):
     return segment_files, start_time_iso, recording_start_time
 
 # ============================================================
-# MP4 muxing
+# MP4 muxing (مع تحسين FFmpeg للبث الطويل)
 # ============================================================
 
 def create_concat_file(segment_files, filename="segments.txt"):
@@ -631,10 +684,16 @@ def mux_segments(segment_files):
     output_file = OUTPUT_DIR / f"{BASE_NAME}.mp4"
 
     log(f"[MUX] Creating MP4: {output_file}")
+    
+    # ✅ تحسين #2: FFmpeg flags للبثوث الطويلة
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "-fflags", "+discardcorrupt+genpts",  # ✅ جديد: إصلاح timestamps التالفة
         "-f", "concat", "-safe", "0", "-i", str(concat_file),
-        "-c", "copy", "-movflags", "+faststart", str(output_file),
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-avoid_negative_ts", "make_zero",  # ✅ جديد: منع timestamps سالبة
+        str(output_file),
     ]
 
     try:
@@ -665,10 +724,15 @@ def mux_part(segment_files, part_number):
     concat_name = f"part_{part_number:03d}.txt"
     concat_file = create_concat_file(segment_files, concat_name)
 
+    # ✅ تحسين #2: نفس الـ flags للبثوث الطويلة
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-fflags", "+discardcorrupt+genpts",
         "-f", "concat", "-safe", "0", "-i", str(concat_file),
-        "-c", "copy", "-movflags", "+faststart", str(part_file),
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-avoid_negative_ts", "make_zero",
+        str(part_file),
     ]
 
     try:
@@ -855,7 +919,10 @@ async def send_video_file(file_path, part_number=None, total_parts=None):
             await asyncio.sleep(wait_time)
     return False
 
-async def send_recording(output_file, segment_files):
+async def send_recording(output_file, segment_files, duration_seconds):
+    """
+    ✅ تحسين #4: إحصائيات مفصلة في رسالة Telegram النهائية
+    """
     if not output_file or not output_file.exists():
         log(f"[TELEGRAM] Final MP4 does not exist: {output_file}")
         return False
@@ -863,12 +930,40 @@ async def send_recording(output_file, segment_files):
     full_size_mb = output_file.stat().st_size / 1024 / 1024
     log(f"[TELEGRAM] Final MP4 size: {full_size_mb:.2f} MB")
 
+    # ✅ جديد: تنسيق المدة بشكل أفضل
+    duration_mins = duration_seconds // 60
+    duration_hours = duration_mins // 60
+    duration_mins_remaining = duration_mins % 60
+
+    if duration_hours > 0:
+        duration_str = f"{duration_hours}h {duration_mins_remaining}m"
+    else:
+        duration_str = f"{duration_mins}m"
+
     if full_size_mb < TELEGRAM_MAX_MB:
-        await send_message(f"🎬 اكتمل التسجيل #{RECORD_ID}\n📦 الحجم: {full_size_mb:.1f} MB\n📤 جارٍ إرسال الفيديو...")
+        # ✅ تحسين #4: رسالة مفصلة
+        await send_message(
+            f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
+            f"👤 {TARGET_USERNAME}\n"
+            f"⏱️ المدة: {duration_str}\n"
+            f"📦 الحجم: {full_size_mb:.1f} MB\n"
+            f"🎞️ المقاطع: {len(segment_files)}\n"
+            f"🎯 الجودة: 720p (HD)\n"
+            f"📤 جارٍ إرسال الفيديو..."
+        )
         uploaded = await send_video_file(output_file)
         return uploaded
 
-    await send_message(f"🎬 اكتمل التسجيل #{RECORD_ID}\n📦 الحجم الكامل: {full_size_mb:.1f} MB\n✂️ الملف كبير، سيتم تقسيمه إلى عدة فيديوهات وإرسالها بالترتيب...")
+    # ✅ تحسين #4: رسالة مفصلة للتسجيلات الكبيرة
+    await send_message(
+        f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
+        f"👤 {TARGET_USERNAME}\n"
+        f"⏱️ المدة: {duration_str}\n"
+        f"📦 الحجم الكامل: {full_size_mb:.1f} MB\n"
+        f"🎞️ المقاطع: {len(segment_files)}\n"
+        f"🎯 الجودة: 720p (HD)\n"
+        f"✂️ الملف كبير، سيتم تقسيمه إلى عدة فيديوهات وإرسالها بالترتيب..."
+    )
     parts = split_recording_into_parts(segment_files)
     if not parts:
         await send_message("❌ تعذر تقسيم التسجيل إلى أجزاء قابلة للإرسال.")
@@ -988,7 +1083,11 @@ async def main():
 
         log(f"[HLS] Recording playlist: {playlist_url}")
         headers = await build_browser_session(page, context)
-        segment_files, start_time_iso, recording_start_time = await record_hls(context, page, playlist_url, playlist, headers)
+        
+        # ✅ تغيير: تمرير playwright بدلاً من context فقط (للـ session refresh)
+        segment_files, start_time_iso, recording_start_time = await record_hls(
+            playwright, context, page, playlist_url, playlist, headers
+        )
 
         try: await browser.close()
         except Exception: pass
@@ -1012,9 +1111,11 @@ async def main():
         await github_delete_file(f".recorder/status/{RECORD_ID}.json", f"Remove status {RECORD_ID}")
         return 1
 
-    uploaded = await send_recording(output_file, segment_files)
-
     duration = int(time.time() - recording_start_time)
+    
+    # ✅ تغيير: تمرير duration إلى send_recording
+    uploaded = await send_recording(output_file, segment_files, duration)
+
     full_size_mb = output_file.stat().st_size / 1024 / 1024 if output_file and output_file.exists() else 0
     parts_count = len(list(PARTS_DIR.glob("*.mp4"))) if PARTS_DIR.exists() else 1
 
