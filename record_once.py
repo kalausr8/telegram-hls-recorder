@@ -53,9 +53,6 @@ PARTS_DIR = OUTPUT_DIR / "parts"
 
 stop_requested = False
 
-# Naming logic for Auto-Record
-BASE_NAME = safe_filename(TARGET_USERNAME) if TARGET_USERNAME else safe_filename(RECORD_ID)
-
 # ============================================================
 # Logging
 # ============================================================
@@ -97,7 +94,7 @@ async def telegram_request(method, data=None, file_data=None, file_name=None):
                 form.add_field(
                     "video",
                     file_data,
-                    filename=file_name or f"{BASE_NAME}.mp4",
+                    filename=file_name or f"{RECORD_ID}.mp4",
                     content_type="video/mp4",
                 )
                 async with session.post(url, data=form) as response:
@@ -291,6 +288,12 @@ def origin_from_url(url):
     parsed = urlparse(url)
     if not parsed.scheme or not parsed.netloc: return ""
     return f"{parsed.scheme}://{parsed.netloc}"
+
+# ============================================================
+# ✅ BASE_NAME defined AFTER safe_filename
+# ============================================================
+
+BASE_NAME = safe_filename(TARGET_USERNAME) if TARGET_USERNAME else safe_filename(RECORD_ID)
 
 # ============================================================
 # Browser session headers
