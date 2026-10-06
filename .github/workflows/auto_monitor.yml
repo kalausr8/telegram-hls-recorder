@@ -1,9 +1,9 @@
 name: Auto Monitor
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
+  workflow_dispatch:  # فقط التشغيل اليدوي أو عبر Worker
+  repository_dispatch:  # للسماح للـ Worker بتشغيله
+    types: [auto_monitor]
 
 jobs:
   monitor:
@@ -51,7 +51,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}  # ✅ New: Add PAT_TOKEN
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
           GITHUB_OWNER: kalausr8
           GITHUB_REPO: telegram-hls-recorder
         run: |
