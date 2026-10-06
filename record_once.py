@@ -290,7 +290,7 @@ def origin_from_url(url):
     return f"{parsed.scheme}://{parsed.netloc}"
 
 # ============================================================
-# ✅ BASE_NAME defined AFTER safe_filename
+# BASE_NAME defined AFTER safe_filename
 # ============================================================
 
 BASE_NAME = safe_filename(TARGET_USERNAME) if TARGET_USERNAME else safe_filename(RECORD_ID)
@@ -404,7 +404,7 @@ async def browser_get_playlist(context, url):
         return None, None
 
 # ============================================================
-# Find live media playlist
+# Find live media playlist (with quality logging)
 # ============================================================
 
 async def find_live_playlist(context, discovered):
@@ -426,8 +426,18 @@ async def find_live_playlist(context, discovered):
 
         if parsed["type"] == "master":
             variants = parsed["variants"]
+            # ✅ Sort by bandwidth descending (highest quality first)
             variants.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
-            log(f"[HLS] Master playlist contains {len(variants)} variants.")
+            
+            # ✅ NEW: Log all available qualities
+            log(f"[HLS] Master playlist contains {len(variants)} variants:")
+            for i, v in enumerate(variants, 1):
+                resolution = v.get("resolution", "unknown")
+                bandwidth = v.get("bandwidth", 0)
+                log(f"  [{i}] Resolution: {resolution} | Bandwidth: {bandwidth} bps")
+            
+            if variants:
+                log(f"[HLS] 🎯 Selected highest quality: {variants[0].get('resolution', 'unknown')}")
 
             for variant in variants:
                 if await check_stop(): return None, None
