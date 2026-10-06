@@ -15,6 +15,7 @@ from playwright.async_api import async_playwright
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+PAT_TOKEN = os.environ.get("PAT_TOKEN", "")  # New: Personal Access Token
 
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "kalausr8")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "telegram-hls-recorder")
@@ -145,14 +146,15 @@ def generate_record_id():
     return ''.join(random.choice(chars) for _ in range(6))
 
 async def trigger_recording(stream_url, username):
-    """Trigger GitHub Actions to start recording"""
-    if not GITHUB_TOKEN:
-        log("[GITHUB] Cannot trigger recording: GITHUB_TOKEN missing")
+    """Trigger GitHub Actions to start recording using PAT_TOKEN"""
+    if not PAT_TOKEN:
+        log("[GITHUB] Cannot trigger recording: PAT_TOKEN missing")
+        await send_message("❌ خطأ في الإعدادات: PAT_TOKEN غير موجود.\n\nيرجى إضافة PAT_TOKEN في GitHub Secrets.")
         return False
     
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/dispatches"
     headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Authorization": f"Bearer {PAT_TOKEN}",  # Use PAT_TOKEN instead of GITHUB_TOKEN
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "telegram-hls-recorder-monitor",
