@@ -1,4 +1,4 @@
-# auto_monitor.py - Optimized with Concurrency
+# auto_monitor.py - Smart Early Exit Version
 
 import asyncio
 import base64
@@ -25,11 +25,10 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "telegram-hls-recorder")
 
 WATCHLIST_PATH = ".recorder/config/watchlist.json"
 
-# ✅ Concurrency Settings
-MAX_CONCURRENT_USERS = 5  # فحص 5 مستخدمين في نفس الوقت
-DETECTION_WAIT = 3.0  # 3 seconds for network events
-WATCH_API_TIMEOUT = 5000  # 5 seconds
-M3U8_TIMEOUT = 3000  # 3 seconds
+# ✅ Optimized Settings
+MAX_CONCURRENT_USERS = 5
+MAX_WAIT_SECONDS = 4.0  # الحد الأقصى 4 ثوانٍ (آمن)
+POLL_INTERVAL = 0.2     # فحص كل 0.2 ثانية (للـ early exit)
 
 # ============================================================
 # Stream Classification
@@ -243,20 +242,21 @@ def is_premium_stream(stream_data, details_data):
     return False
 
 # ============================================================
-# Playwright Monitor (Optimized with Concurrency)
+# Playwright Monitor (with Smart Early Exit)
 # ============================================================
 
 async def check_user_live_status(browser, username):
     """
-    Optimized detection with shared browser instance.
-    Uses asyncio.sleep instead of wait_for_event to allow concurrency.
+    Smart Early Exit:
+    - Checks every 0.2 seconds if stream detected
+    - Exits immediately when found (saves time)
+    - Waits full 4 seconds only for OFFLINE users
     """
     profile_url = f"https://www.tango.me/{username}"
     start_time = time.time()
     
-    log(f"[MONITOR] Checking {username} at {profile_url}")
+    log(f"[MONITOR] [{username}] Checking at {profile_url}")
     
-    # Create new page for this user (shared browser)
     context = await browser.new_context(
         viewport={"width": 1280, "height": 720},
         user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -269,17 +269,15 @@ async def check_user_live_status(browser, username):
         "stream_url": None,
         "stream_id": None,
         "watch_api_data": None,
-        "has_stream_object": False,
     }
     
-    # Intercept network responses
     async def handle_response(response):
         try:
             url = response.url
             
             # Look for Tango's stream watch API
             if "proxycador/api/public/v1/live/stream/v2/watch" in url:
-                log(f"[MONITOR] [{username}] Found Tango watch API")
+                log(f"[MONITOR] [{username}] Found watch API")
                 if response.status == 200:
                     try:
                         data = await response.json()
@@ -290,27 +288,24 @@ async def check_user_live_status(browser, username):
                             
                             if "stream" in details:
                                 stream = details["stream"]
-                                stream_info["has_stream_object"] = True
-                                
-                                log(f"[MONITOR] [{username}] Stream object found: {json.dumps(stream, indent=2)[:500]}")
                                 
                                 if is_premium_stream(stream, details):
                                     stream_info["status"] = StreamStatus.LIVE_PREMIUM
                                     stream_info["stream_id"] = stream.get("id")
-                                    log(f"[MONITOR] [{username}] 🟡 Detected PREMIUM stream")
+                                    log(f"[MONITOR] [{username}] 🟡 PREMIUM detected")
                                 else:
                                     stream_info["status"] = StreamStatus.LIVE_NORMAL
                                     stream_info["stream_id"] = stream.get("id")
                                     stream_info["stream_url"] = profile_url
-                                    log(f"[MONITOR] [{username}] ✅ Detected NORMAL live stream")
+                                    log(f"[MONITOR] [{username}] ✅ NORMAL live detected")
                             else:
-                                log(f"[MONITOR] [{username}] Watch API has no stream object → OFFLINE")
+                                log(f"[MONITOR] [{username}] Watch API has no stream → OFFLINE")
                     except Exception as exc:
                         log(f"[MONITOR] [{username}] Error parsing watch API: {exc}")
             
             # Look for actual m3u8 requests
             if ".m3u8" in url.lower() and stream_info["status"] == StreamStatus.OFFLINE:
-                log(f"[MONITOR] [{username}] ✅ Found m3u8 request")
+                log(f"[MONITOR] [{username}] ✅ m3u8 detected")
                 stream_info["status"] = StreamStatus.LIVE_NORMAL
                 stream_info["stream_url"] = profile_url
                     
@@ -323,8 +318,16 @@ async def check_user_live_status(browser, username):
         # Navigate to profile page
         await page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
         
-        # ✅ Wait for network events (non-blocking for concurrency)
-        await asyncio.sleep(DETECTION_WAIT)
+        # ✅ Smart Early Exit: Poll every 0.2s, exit early if detected
+        max_iterations = int(MAX_WAIT_SECONDS / POLL_INTERVAL)
+        for i in range(max_iterations):
+            await asyncio.sleep(POLL_INTERVAL)
+            
+            # ✅ Early exit if stream detected
+            if stream_info["status"] != StreamStatus.OFFLINE:
+                elapsed = time.time() - start_time
+                log(f"[MONITOR] [{username}] ⚡ Early exit after {elapsed:.1f}s (status: {stream_info['status']})")
+                break
         
     except Exception as exc:
         log(f"[MONITOR] [{username}] Error: {exc}")
@@ -342,7 +345,7 @@ async def check_user_live_status(browser, username):
 
 async def main():
     log("=" * 60)
-    log("Auto-Monitor Started (Optimized with Concurrency)")
+    log("Auto-Monitor Started (Smart Early Exit)")
     log("=" * 60)
     
     start_time = time.time()
@@ -410,7 +413,7 @@ async def main():
                     return username, StreamStatus.OFFLINE, None
         
         # ✅ Check all users concurrently
-        log(f"[MONITOR] Starting concurrent check for {len(users_to_check)} users (max {MAX_CONCURRENT_USERS} at a time)...")
+        log(f"[MONITOR] Starting concurrent check for {len(users_to_check)} users...")
         tasks = [check_with_semaphore(username) for username in users_to_check]
         results = await asyncio.gather(*tasks)
         
@@ -437,7 +440,6 @@ async def main():
             await send_message(f"🟡 {username} يبث حالياً لكن البث مدفوع (Premium) - تم التجاهل")
         
         else:
-            log(f"[MONITOR] ❌ {username} is OFFLINE")
             stats["offline"] += 1
     
     elapsed_total = time.time() - start_time
