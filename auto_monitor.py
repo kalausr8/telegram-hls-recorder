@@ -1,4 +1,4 @@
-# auto_monitor.py - Ultimate Robust Version
+# auto_monitor.py - Final Corrected & Robust Version
 
 import asyncio
 import base64
@@ -28,8 +28,8 @@ WATCHLIST_PATH = ".recorder/config/watchlist.json"
 
 # ✅ Optimized & Robust Settings
 MAX_CONCURRENT_USERS = 5
-MAX_WAIT_SECONDS = 8.0      # ✅ زيادة إلى 8 ثوانٍ لضمان اكتشاف البثوث حتى مع بطء الشبكة
-POLL_INTERVAL = 0.5         # ✅ فحص كل نصف ثانية لتقليل استهلاك المعالج
+MAX_WAIT_SECONDS = 8.0      # وقت انتظار آمن لضمان تحميل البث
+POLL_INTERVAL = 0.5         # فحص كل نصف ثانية
 
 # ✅ Safety Settings
 MAX_RECORDING_AGE_HOURS = 6
@@ -123,7 +123,6 @@ async def github_get_file(path):
         return None
 
 async def github_get_file_last_commit_time(path):
-    """Get the last commit time for a file (when it was last updated)"""
     if not GITHUB_TOKEN:
         return None
     
@@ -153,7 +152,6 @@ async def github_get_file_last_commit_time(path):
         return None
 
 async def github_delete_file(path, message):
-    """Delete file from GitHub using PAT_TOKEN (write permissions)"""
     if not PAT_TOKEN:
         log("[GITHUB] Cannot delete: PAT_TOKEN missing")
         return
@@ -188,7 +186,6 @@ async def github_delete_file(path, message):
         log(f"[GITHUB] Exception deleting {path}: {exc}")
 
 async def is_recording_actually_alive(record_id, started_at_str):
-    """Verify if a recording is actually still running"""
     if started_at_str:
         try:
             start_time = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
@@ -231,7 +228,6 @@ async def is_recording_actually_alive(record_id, started_at_str):
     return True
 
 async def github_get_active_usernames():
-    """Get list of usernames currently being recorded with verification"""
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/git/trees/main?recursive=1"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -361,7 +357,7 @@ def is_premium_stream(stream_data, details_data):
     return False
 
 # ============================================================
-# Playwright Monitor (Ultimate Robust Version)
+# Playwright Monitor
 # ============================================================
 
 async def check_user_live_status(browser, username):
@@ -419,14 +415,13 @@ async def check_user_live_status(browser, username):
     try:
         await page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
         
-        # ✅ NEW: Mouse movement nudge to force JS/Video player initialization in headless mode
+        # ✅ خدعة حركة الماوس لإجبار المتصفح على تحميل مشغل الفيديو
         try:
             await page.mouse.move(100, 100)
             await asyncio.sleep(0.5)
         except Exception:
             pass
         
-        # Smart Early Exit: Poll every 0.5s, up to 8 seconds max
         max_iterations = int(MAX_WAIT_SECONDS / POLL_INTERVAL)
         for i in range(max_iterations):
             await asyncio.sleep(POLL_INTERVAL)
@@ -451,7 +446,7 @@ async def check_user_live_status(browser, username):
 
 async def main():
     log("=" * 60)
-    log("Auto-Monitor Started (Ultimate Robust Version)")
+    log("Auto-Monitor Started (Final Corrected Version)")
     log("=" * 60)
     
     start_time = time.time()
@@ -468,7 +463,8 @@ async def main():
     log(f"[MONITOR] Verified active recordings: {active_usernames}")
     
     users_to_check = []
-    for username in watchlist: # Note: 'watchlist' is defined above as watchlist_data
+    # ✅ تم تصحيح الخطأ هنا: استخدام watchlist_data بدلاً من watchlist
+    for username in watchlist_data:
         username_lower = username.lower()
         if username_lower in active_usernames:
             log(f"[MONITOR] {username} is already recording, skipping")
@@ -532,7 +528,6 @@ async def main():
     log(f"  - New recordings started: {new_recordings}")
     log("=" * 60)
     
-    # ✅ NEW: Crystal clear Telegram message
     summary = f"✅ انتهى الفحص في {elapsed_total:.1f} ثانية.\n\n"
     summary += f"📊 إحصائيات القائمة ({total_watchlist} مستخدم):\n"
     summary += f"• قيد التسجيل مسبقاً: {total_watchlist - len(users_to_check)}\n"
