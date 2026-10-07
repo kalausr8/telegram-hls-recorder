@@ -1,4 +1,4 @@
-# auto_monitor.py - Smart Early Exit Version
+# auto_monitor.py - Complete Version with Safety
 
 import asyncio
 import base64
@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -27,8 +28,11 @@ WATCHLIST_PATH = ".recorder/config/watchlist.json"
 
 # ✅ Optimized Settings
 MAX_CONCURRENT_USERS = 5
-MAX_WAIT_SECONDS = 4.0  # الحد الأقصى 4 ثوانٍ (آمن)
-POLL_INTERVAL = 0.2     # فحص كل 0.2 ثانية (للـ early exit)
+MAX_WAIT_SECONDS = 4.0
+POLL_INTERVAL = 0.2
+
+# ✅ Safety Settings
+MAX_RECORDING_AGE_HOURS = 6  # اعتبار الملفات أقدم من 6 ساعات "قديمة"
 
 # ============================================================
 # Stream Classification
@@ -117,8 +121,42 @@ async def github_get_file(path):
         log(f"[GITHUB] Exception: {exc}")
         return None
 
+async def github_delete_file(path, message):
+    if not GITHUB_TOKEN:
+        return
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "telegram-hls-recorder-monitor",
+    }
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            sha = None
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    sha = data.get("sha")
+            
+            if not sha:
+                return
+                
+            body = {"message": message, "sha": sha}
+            async with session.delete(url, headers=headers, json=body) as resp:
+                if resp.status not in (200, 204):
+                    log(f"[GITHUB] Delete failed for {path}: HTTP {resp.status}")
+                else:
+                    log(f"[GITHUB] Deleted {path}")
+    except Exception as exc:
+        log(f"[GITHUB] Exception deleting {path}: {exc}")
+
 async def github_get_active_usernames():
-    """Get list of usernames currently being recorded"""
+    """
+    Get list of usernames currently being recorded.
+    ✅ NEW: Cleanup stale files older than MAX_RECORDING_AGE_HOURS
+    """
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/git/trees/main?recursive=1"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -143,6 +181,22 @@ async def github_get_active_usernames():
                 for file_info in active_files:
                     file_data = await github_get_file(file_info["path"])
                     if file_data and "username" in file_data:
+                        # ✅ NEW: Check file age
+                        started_at = file_data.get("started_at", "")
+                        if started_at:
+                            try:
+                                start_time = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                                age = datetime.now(timezone.utc) - start_time
+                                age_hours = age.total_seconds() / 3600
+                                
+                                # If older than MAX_RECORDING_AGE_HOURS, consider it stale and delete
+                                if age_hours > MAX_RECORDING_AGE_HOURS:
+                                    log(f"[GITHUB] 🗑️ Deleting stale active file: {file_info['path']} (age: {age_hours:.1f}h)")
+                                    await github_delete_file(file_info["path"], f"Cleanup stale {file_info['path']}")
+                                    continue
+                            except Exception as exc:
+                                log(f"[GITHUB] Error parsing started_at: {exc}")
+                        
                         usernames.append(file_data["username"].lower())
                 
                 return usernames
@@ -345,7 +399,7 @@ async def check_user_live_status(browser, username):
 
 async def main():
     log("=" * 60)
-    log("Auto-Monitor Started (Smart Early Exit)")
+    log("Auto-Monitor Started (Complete Version)")
     log("=" * 60)
     
     start_time = time.time()
@@ -364,7 +418,7 @@ async def main():
     
     log(f"[MONITOR] Found {len(watchlist)} users in watchlist")
     
-    # Get currently recording usernames
+    # Get currently recording usernames (with cleanup)
     active_usernames = await github_get_active_usernames()
     log(f"[MONITOR] Currently recording: {active_usernames}")
     
@@ -432,7 +486,7 @@ async def main():
             success = await trigger_recording(stream_url, username)
             if success:
                 new_recordings += 1
-                active_usernames.append(username.lower())
+                active_usernames.append(username.lower())  # ✅ Update immediately
         
         elif status == StreamStatus.LIVE_PREMIUM:
             log(f"[MONITOR] 🟡 {username} is LIVE but PREMIUM - SKIPPING")
