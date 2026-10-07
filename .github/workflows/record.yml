@@ -13,7 +13,7 @@ concurrency:
 jobs:
   record:
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 360
     permissions:
       contents: write
 
