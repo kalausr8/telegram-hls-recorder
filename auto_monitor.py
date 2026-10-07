@@ -1,4 +1,4 @@
-# auto_monitor.py - Complete Version with PAT_TOKEN for Cleanup
+# auto_monitor.py - Complete Version with Status Verification
 
 import asyncio
 import base64
@@ -33,6 +33,7 @@ POLL_INTERVAL = 0.2
 
 # ✅ Safety Settings
 MAX_RECORDING_AGE_HOURS = 6
+MAX_STATUS_STALE_MINUTES = 10  # إذا لم يُحدّث status خلال 10 دقائق → توقف
 
 # ============================================================
 # Stream Classification
@@ -121,6 +122,36 @@ async def github_get_file(path):
         log(f"[GITHUB] Exception: {exc}")
         return None
 
+async def github_get_file_last_commit_time(path):
+    """Get the last commit time for a file (when it was last updated)"""
+    if not GITHUB_TOKEN:
+        return None
+    
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits?path={path}&per_page=1"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "telegram-hls-recorder-monitor",
+    }
+    
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                
+                data = await resp.json()
+                if data and len(data) > 0:
+                    commit_date = data[0].get("commit", {}).get("committer", {}).get("date", "")
+                    if commit_date:
+                        return datetime.fromisoformat(commit_date.replace("Z", "+00:00"))
+                return None
+    except Exception as exc:
+        log(f"[GITHUB] Exception getting commit time for {path}: {exc}")
+        return None
+
 async def github_delete_file(path, message):
     """Delete file from GitHub using PAT_TOKEN (write permissions)"""
     if not PAT_TOKEN:
@@ -156,10 +187,69 @@ async def github_delete_file(path, message):
     except Exception as exc:
         log(f"[GITHUB] Exception deleting {path}: {exc}")
 
+async def is_recording_actually_alive(record_id, started_at_str):
+    """
+    Verify if a recording is actually still running by checking:
+    1. File age (must be < MAX_RECORDING_AGE_HOURS)
+    2. Status file existence and freshness (must be updated within MAX_STATUS_STALE_MINUTES)
+    
+    Returns True if recording is alive, False if it should be cleaned up.
+    """
+    # Check 1: File age
+    if started_at_str:
+        try:
+            start_time = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+            age = datetime.now(timezone.utc) - start_time
+            age_hours = age.total_seconds() / 3600
+            
+            if age_hours > MAX_RECORDING_AGE_HOURS:
+                log(f"[VERIFY] ❌ {record_id}: File too old ({age_hours:.1f}h > {MAX_RECORDING_AGE_HOURS}h)")
+                return False
+        except Exception as exc:
+            log(f"[VERIFY] ⚠️ {record_id}: Error parsing started_at: {exc}")
+    
+    # Check 2: Status file freshness
+    status_path = f".recorder/status/{record_id}.json"
+    status_data = await github_get_file(status_path)
+    
+    if status_data is None:
+        # No status file exists
+        # If recording just started (< 2 minutes ago), give it benefit of doubt
+        if started_at_str:
+            try:
+                start_time = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+                age_minutes = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
+                if age_minutes < 2:
+                    log(f"[VERIFY] ✅ {record_id}: Just started ({age_minutes:.1f}m ago), no status yet - OK")
+                    return True
+            except Exception:
+                pass
+        
+        log(f"[VERIFY] ❌ {record_id}: No status file found - recording likely stopped")
+        return False
+    
+    # Status file exists - check when it was last updated
+    last_commit_time = await github_get_file_last_commit_time(status_path)
+    
+    if last_commit_time is None:
+        # Cannot determine last update time - be conservative and keep it
+        log(f"[VERIFY] ⚠️ {record_id}: Cannot check status freshness - keeping as active")
+        return True
+    
+    stale_minutes = (datetime.now(timezone.utc) - last_commit_time).total_seconds() / 60
+    
+    if stale_minutes > MAX_STATUS_STALE_MINUTES:
+        log(f"[VERIFY] ❌ {record_id}: Status stale ({stale_minutes:.1f}m > {MAX_STATUS_STALE_MINUTES}m) - recording stopped")
+        return False
+    
+    log(f"[VERIFY] ✅ {record_id}: Status fresh ({stale_minutes:.1f}m ago) - recording alive")
+    return True
+
 async def github_get_active_usernames():
     """
     Get list of usernames currently being recorded.
-    Cleanup stale files older than MAX_RECORDING_AGE_HOURS
+    Verifies each recording is actually alive before including it.
+    Cleans up stale/dead recordings.
     """
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/git/trees/main?recursive=1"
     headers = {
@@ -181,27 +271,35 @@ async def github_get_active_usernames():
                 
                 active_files = [f for f in tree if f["path"].startswith(".recorder/active/") and f["path"].endswith(".json")]
                 
+                if not active_files:
+                    log("[MONITOR] No active recordings found")
+                    return []
+                
+                log(f"[MONITOR] Found {len(active_files)} active file(s), verifying...")
+                
                 usernames = []
                 for file_info in active_files:
                     file_data = await github_get_file(file_info["path"])
-                    if file_data and "username" in file_data:
-                        # Check file age
-                        started_at = file_data.get("started_at", "")
-                        if started_at:
-                            try:
-                                start_time = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-                                age = datetime.now(timezone.utc) - start_time
-                                age_hours = age.total_seconds() / 3600
-                                
-                                # If older than MAX_RECORDING_AGE_HOURS, consider it stale and delete
-                                if age_hours > MAX_RECORDING_AGE_HOURS:
-                                    log(f"[GITHUB] 🗑️ Deleting stale active file: {file_info['path']} (age: {age_hours:.1f}h)")
-                                    await github_delete_file(file_info["path"], f"Cleanup stale {file_info['path']}")
-                                    continue
-                            except Exception as exc:
-                                log(f"[GITHUB] Error parsing started_at: {exc}")
-                        
-                        usernames.append(file_data["username"].lower())
+                    if not file_data or "username" not in file_data:
+                        continue
+                    
+                    record_id = file_data.get("record_id", "UNKNOWN")
+                    started_at = file_data.get("started_at", "")
+                    username = file_data["username"]
+                    
+                    # ✅ Verify recording is actually alive
+                    is_alive = await is_recording_actually_alive(record_id, started_at)
+                    
+                    if is_alive:
+                        usernames.append(username.lower())
+                        log(f"[MONITOR] ✅ {username} is genuinely recording (#{record_id})")
+                    else:
+                        # Clean up dead recording
+                        log(f"[MONITOR] 🗑️ {username} recording is dead, cleaning up (#{record_id})...")
+                        await github_delete_file(file_info["path"], f"Cleanup dead recording {record_id}")
+                        # Also clean up status file if exists
+                        status_path = f".recorder/status/{record_id}.json"
+                        await github_delete_file(status_path, f"Cleanup dead status {record_id}")
                 
                 return usernames
     except Exception as exc:
@@ -422,9 +520,9 @@ async def main():
     
     log(f"[MONITOR] Found {len(watchlist)} users in watchlist")
     
-    # Get currently recording usernames (with cleanup)
+    # Get currently recording usernames (with verification and cleanup)
     active_usernames = await github_get_active_usernames()
-    log(f"[MONITOR] Currently recording: {active_usernames}")
+    log(f"[MONITOR] Verified active recordings: {active_usernames}")
     
     # Filter users to check
     users_to_check = []
