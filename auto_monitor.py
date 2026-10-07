@@ -1,4 +1,4 @@
-# auto_monitor.py - Complete Version with Safety
+# auto_monitor.py - Complete Version with PAT_TOKEN for Cleanup
 
 import asyncio
 import base64
@@ -32,7 +32,7 @@ MAX_WAIT_SECONDS = 4.0
 POLL_INTERVAL = 0.2
 
 # ✅ Safety Settings
-MAX_RECORDING_AGE_HOURS = 6  # اعتبار الملفات أقدم من 6 ساعات "قديمة"
+MAX_RECORDING_AGE_HOURS = 6
 
 # ============================================================
 # Stream Classification
@@ -122,15 +122,19 @@ async def github_get_file(path):
         return None
 
 async def github_delete_file(path, message):
-    if not GITHUB_TOKEN:
+    """Delete file from GitHub using PAT_TOKEN (write permissions)"""
+    if not PAT_TOKEN:
+        log("[GITHUB] Cannot delete: PAT_TOKEN missing")
         return
+    
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
     headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Authorization": f"Bearer {PAT_TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "telegram-hls-recorder-monitor",
     }
+    
     timeout = aiohttp.ClientTimeout(total=15)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -148,14 +152,14 @@ async def github_delete_file(path, message):
                 if resp.status not in (200, 204):
                     log(f"[GITHUB] Delete failed for {path}: HTTP {resp.status}")
                 else:
-                    log(f"[GITHUB] Deleted {path}")
+                    log(f"[GITHUB] ✅ Deleted {path}")
     except Exception as exc:
         log(f"[GITHUB] Exception deleting {path}: {exc}")
 
 async def github_get_active_usernames():
     """
     Get list of usernames currently being recorded.
-    ✅ NEW: Cleanup stale files older than MAX_RECORDING_AGE_HOURS
+    Cleanup stale files older than MAX_RECORDING_AGE_HOURS
     """
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/git/trees/main?recursive=1"
     headers = {
@@ -181,7 +185,7 @@ async def github_get_active_usernames():
                 for file_info in active_files:
                     file_data = await github_get_file(file_info["path"])
                     if file_data and "username" in file_data:
-                        # ✅ NEW: Check file age
+                        # Check file age
                         started_at = file_data.get("started_at", "")
                         if started_at:
                             try:
@@ -372,12 +376,12 @@ async def check_user_live_status(browser, username):
         # Navigate to profile page
         await page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
         
-        # ✅ Smart Early Exit: Poll every 0.2s, exit early if detected
+        # Smart Early Exit: Poll every 0.2s, exit early if detected
         max_iterations = int(MAX_WAIT_SECONDS / POLL_INTERVAL)
         for i in range(max_iterations):
             await asyncio.sleep(POLL_INTERVAL)
             
-            # ✅ Early exit if stream detected
+            # Early exit if stream detected
             if stream_info["status"] != StreamStatus.OFFLINE:
                 elapsed = time.time() - start_time
                 log(f"[MONITOR] [{username}] ⚡ Early exit after {elapsed:.1f}s (status: {stream_info['status']})")
@@ -443,7 +447,7 @@ async def main():
     new_recordings = 0
     max_new_recordings = 5
     
-    # ✅ Use shared browser with concurrency
+    # Use shared browser with concurrency
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True,
@@ -466,7 +470,7 @@ async def main():
                     log(f"[MONITOR] Error checking {username}: {exc}")
                     return username, StreamStatus.OFFLINE, None
         
-        # ✅ Check all users concurrently
+        # Check all users concurrently
         log(f"[MONITOR] Starting concurrent check for {len(users_to_check)} users...")
         tasks = [check_with_semaphore(username) for username in users_to_check]
         results = await asyncio.gather(*tasks)
@@ -486,7 +490,7 @@ async def main():
             success = await trigger_recording(stream_url, username)
             if success:
                 new_recordings += 1
-                active_usernames.append(username.lower())  # ✅ Update immediately
+                active_usernames.append(username.lower())
         
         elif status == StreamStatus.LIVE_PREMIUM:
             log(f"[MONITOR] 🟡 {username} is LIVE but PREMIUM - SKIPPING")
