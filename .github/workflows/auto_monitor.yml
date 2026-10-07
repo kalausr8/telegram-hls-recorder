@@ -1,9 +1,14 @@
 name: Auto Monitor
 
 on:
-  workflow_dispatch:  # فقط التشغيل اليدوي أو عبر Worker
-  repository_dispatch:  # للسماح للـ Worker بتشغيله
+  workflow_dispatch:
+  repository_dispatch:
     types: [auto_monitor]
+
+# ✅ منع تشغيل أكثر من نسخة في نفس الوقت
+concurrency:
+  group: auto-monitor
+  cancel-in-progress: false
 
 jobs:
   monitor:
