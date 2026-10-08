@@ -2,8 +2,8 @@
   "record_id": "PPI9IN",
   "url": "https://www.tango.me/kindfox-4782",
   "username": "kindfox-4782",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 90,
+  "segments_count": 49,
+  "size_mb": 13.63,
   "hls_status": "recording"
 }
