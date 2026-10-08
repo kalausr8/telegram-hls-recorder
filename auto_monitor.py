@@ -60,7 +60,15 @@ POLL_INTERVAL = 0.5
 
 # Safety settings.
 MAX_RECORDING_AGE_HOURS = 6
-MAX_STATUS_STALE_MINUTES = 10
+
+# A STARTING lease is considered abandoned after this many minutes
+# without a fresh heartbeat.
+STARTING_LEASE_GRACE_MINUTES = 10
+
+# A recording lease is considered stale only when both its heartbeat
+# and its corresponding status commit are stale.
+RECORDING_LEASE_STALE_MINUTES = 15
+
 MALFORMED_LEASE_GRACE_MINUTES = 30
 
 
@@ -184,7 +192,8 @@ async def github_get_file(path):
 
     except Exception as exc:
         log(f"[GITHUB] Exception: {exc}")
-        return None
+
+    return None
 
 
 async def github_update_file(path, content, message):
@@ -474,7 +483,7 @@ async def is_recording_actually_alive(record_data):
 
     if state == "starting":
 
-        if stale_minutes <= 15:
+        if stale_minutes <= STARTING_LEASE_GRACE_MINUTES:
             log(
                 f"[VERIFY] âœ… {record_id}: STARTING lease fresh "
                 f"({stale_minutes:.1f}m)"
@@ -487,15 +496,22 @@ async def is_recording_actually_alive(record_data):
         )
         return False
 
-    if stale_minutes <= MAX_STATUS_STALE_MINUTES:
+    if stale_minutes <= RECORDING_LEASE_STALE_MINUTES:
         log(
             f"[VERIFY] âœ… {record_id}: {state.upper()} heartbeat fresh "
             f"({stale_minutes:.1f}m)"
         )
         return True
 
-    # Conservative safety rule: never free a slot solely because a
-    # GitHub status commit is stale or missing.
+    # Heartbeat is stale. Before removing the lease, verify the
+    # corresponding status file and its latest commit.
+    #
+    # We only remove the lease when BOTH:
+    #   1. heartbeat is stale
+    #   2. status commit is also stale
+    #
+    # If GitHub cannot be queried or the status cannot be verified,
+    # fail closed and KEEP the lease active.
     status_path = f".recorder/status/{record_id}.json"
 
     status_data = await github_get_file(status_path)
@@ -522,7 +538,7 @@ async def is_recording_actually_alive(record_data):
         datetime.now(timezone.utc) - last_commit_time
     ).total_seconds() / 60
 
-    if status_stale_minutes <= MAX_STATUS_STALE_MINUTES:
+    if status_stale_minutes <= RECORDING_LEASE_STALE_MINUTES:
         log(
             f"[VERIFY] âœ… {record_id}: status commit fresh "
             f"({status_stale_minutes:.1f}m)"
@@ -530,10 +546,12 @@ async def is_recording_actually_alive(record_data):
         return True
 
     log(
-        f"[VERIFY] âš ï¸ {record_id}: heartbeat/status stale "
-        f"({status_stale_minutes:.1f}m) -> KEEPING ACTIVE"
+        f"[VERIFY] ðŸ—‘ï¸ {record_id}: heartbeat and status are stale "
+        f"(heartbeat={stale_minutes:.1f}m, "
+        f"status={status_stale_minutes:.1f}m) -> removable"
     )
-    return True
+
+    return False
 
 
 async def github_get_active_recordings():
@@ -613,12 +631,11 @@ async def github_get_active_recordings():
                     # ----------------------------------------------------
                     # Non-dict / unreadable lease.
                     #
-                    # This is different from a valid JSON object with
-                    # missing fields. The latter is handled by
-                    # is_recording_actually_alive().
+                    # Determine whether the malformed lease is still
+                    # recent by checking its latest Git commit.
                     #
-                    # We cannot safely inspect timestamps/state here,
-                    # therefore keep the conservative behaviour.
+                    # If GitHub cannot provide the commit timestamp,
+                    # fail closed and keep the lease active.
                     # ----------------------------------------------------
                     if not isinstance(file_data, dict):
 
@@ -627,22 +644,81 @@ async def github_get_active_recordings():
                         log(
                             f"[VERIFY] âš ï¸ {record_id}: malformed lease "
                             "cannot be verified from JSON -> "
-                            "checking timestamp/state"
+                            "checking latest commit age"
                         )
 
-                        # If the file itself is not valid JSON or cannot
-                        # be represented as a dict, we cannot safely verify
-                        # its internal timestamp/state.
-                        #
-                        # Keep the existing conservative behaviour here.
-                        active_recordings.append(
-                            {
-                                "username": (
-                                    f"unknown:{record_id}"
-                                ).lower(),
-                                "record_id": record_id,
-                                "path": path,
-                            }
+                        last_commit_time = (
+                            await github_get_file_last_commit_time(
+                                path
+                            )
+                        )
+
+                        # If GitHub did not allow us to determine the
+                        # commit age, fail closed and KEEP the lease.
+                        if last_commit_time is None:
+
+                            log(
+                                f"[VERIFY] âš ï¸ {record_id}: cannot determine "
+                                "malformed lease commit age "
+                                "-> KEEPING ACTIVE"
+                            )
+
+                            active_recordings.append(
+                                {
+                                    "username": (
+                                        f"unknown:{record_id}"
+                                    ).lower(),
+                                    "record_id": record_id,
+                                    "path": path,
+                                }
+                            )
+
+                            continue
+
+                        commit_age_minutes = (
+                            datetime.now(timezone.utc)
+                            - last_commit_time
+                        ).total_seconds() / 60
+
+                        if (
+                            commit_age_minutes
+                            <= RECORDING_LEASE_STALE_MINUTES
+                        ):
+
+                            log(
+                                f"[VERIFY] âš ï¸ {record_id}: malformed lease "
+                                f"commit is recent "
+                                f"({commit_age_minutes:.1f}m) "
+                                "-> KEEPING ACTIVE"
+                            )
+
+                            active_recordings.append(
+                                {
+                                    "username": (
+                                        f"unknown:{record_id}"
+                                    ).lower(),
+                                    "record_id": record_id,
+                                    "path": path,
+                                }
+                            )
+
+                            continue
+
+                        log(
+                            f"[VERIFY] ðŸ—‘ï¸ {record_id}: malformed lease "
+                            f"commit is stale "
+                            f"({commit_age_minutes:.1f}m) "
+                            "-> removable"
+                        )
+
+                        await github_delete_file(
+                            path,
+                            f"Cleanup stale malformed lease {record_id}",
+                        )
+
+                        await github_delete_file(
+                            f".recorder/status/{record_id}.json",
+                            f"Cleanup stale malformed status {record_id}",
                         )
 
                         continue
@@ -715,6 +791,9 @@ async def github_get_active_recordings():
 async def github_get_active_usernames():
 
     active_recordings = await github_get_active_recordings()
+
+    if active_recordings is None:
+        return []
 
     return [
         recording["username"]
