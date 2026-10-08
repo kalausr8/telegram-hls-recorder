@@ -27,6 +27,8 @@ GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "kalausr8")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "telegram-hls-recorder")
 RECORD_ID = os.environ.get("RECORD_ID", "UNKNOWN")
 TARGET_USERNAME = os.environ.get("TARGET_USERNAME", "").strip()
+DISPLAY_NAME = os.environ.get("DISPLAY_NAME", "").strip() or TARGET_USERNAME
+ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "").strip()
 
 PAGE_URL = sys.argv[1].strip() if len(sys.argv) > 1 else ""
 
@@ -48,6 +50,9 @@ STATUS_UPDATE_INTERVAL = 60
 
 # ✅ تحسين #3: إعادة فتح الـ session كل 45 دقيقة
 SESSION_REFRESH_INTERVAL = 45 * 60  # 45 دقيقة
+MAX_RECORDING_SECONDS = 6 * 60 * 60
+NO_NEW_SEGMENTS_TIMEOUT = 120
+HEARTBEAT_FAILURE_LIMIT = 3
 
 STOP_FILE = f".recorder/stop/{RECORD_ID}"
 
@@ -130,9 +135,50 @@ async def send_message(text):
 # GitHub State Management
 # ============================================================
 
+async def github_read_json(path):
+    if not GITHUB_TOKEN:
+        return None, False
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "telegram-hls-recorder",
+    }
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 404:
+                    return None, True
+                if resp.status != 200:
+                    log(f"[GITHUB] Read failed for {path}: HTTP {resp.status}")
+                    return None, False
+                data = await resp.json()
+                encoded = data.get("content")
+                if not encoded:
+                    return None, False
+                raw = base64.b64decode(encoded.replace("\n", "")).decode("utf-8", errors="replace")
+                return json.loads(raw), True
+    except Exception as exc:
+        log(f"[GITHUB] Exception reading {path}: {exc}")
+        return None, False
+
+
+def redact_url(url):
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+        clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        return clean
+    except Exception:
+        return str(url).split("?", 1)[0]
+
+
 async def github_update_file(path, content_dict, message):
     if not GITHUB_TOKEN:
-        return
+        return False
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -148,20 +194,23 @@ async def github_update_file(path, content_dict, message):
                 if resp.status == 200:
                     data = await resp.json()
                     sha = data.get("sha")
-            
+                elif resp.status != 404:
+                    log(f"[GITHUB] Cannot inspect {path}: HTTP {resp.status}")
+                    return False
             encoded = base64.b64encode(json.dumps(content_dict, indent=2).encode("utf-8")).decode("utf-8")
             body = {"message": message, "content": encoded}
             if sha:
                 body["sha"] = sha
-                
             async with session.put(url, headers=headers, json=body) as resp:
                 if resp.status not in (200, 201):
                     text = await resp.text()
                     log(f"[GITHUB] Update failed for {path}: HTTP {resp.status} - {text[:500]}")
-                else:
-                    log(f"[GITHUB] Updated {path}")
+                    return False
+                return True
     except Exception as exc:
         log(f"[GITHUB] Exception updating {path}: {exc}")
+        return False
+
 
 async def github_delete_file(path, message):
     if not GITHUB_TOKEN:
@@ -251,9 +300,6 @@ async def github_stop_requested():
                     log("[STOP] Valid text stop signal detected.")
                     return True
 
-                if raw_stripped:
-                    log(f"[STOP] Stop file exists for {RECORD_ID}; treating it as a stop signal.")
-                    return True
 
     except asyncio.CancelledError:
         raise
@@ -298,7 +344,7 @@ def origin_from_url(url):
 # BASE_NAME defined AFTER safe_filename
 # ============================================================
 
-BASE_NAME = safe_filename(TARGET_USERNAME) if TARGET_USERNAME else safe_filename(RECORD_ID)
+BASE_NAME = safe_filename(DISPLAY_NAME) if DISPLAY_NAME else (safe_filename(TARGET_USERNAME) if TARGET_USERNAME else safe_filename(RECORD_ID))
 
 # ============================================================
 # Browser session headers
@@ -334,7 +380,7 @@ async def inspect_page_for_hls(page, discovered):
             url = url.replace("&amp;", "&")
             if url not in discovered:
                 discovered.append(url)
-                log(f"[HLS] Discovered from HTML: {url}")
+                log(f"[HLS] Discovered from HTML: {redact_url(url)}")
     except Exception as exc:
         log(f"[HLS] HTML inspection failed: {exc}")
 
@@ -345,7 +391,7 @@ async def inspect_page_for_hls(page, discovered):
         for url in performance_urls:
             if url not in discovered:
                 discovered.append(url)
-                log(f"[HLS] Discovered from performance: {url}")
+                log(f"[HLS] Discovered from performance: {redact_url(url)}")
     except Exception as exc:
         log(f"[HLS] Performance inspection failed: {exc}")
 
@@ -355,7 +401,7 @@ async def inspect_page_for_hls(page, discovered):
 
 def parse_playlist(text, playlist_url):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines: return {"type": "empty", "variants": [], "segments": []}
+    if not lines: return {"type": "empty", "variants": [], "segments": [], "endlist": False}
 
     variants = []
     segments = []
@@ -383,15 +429,16 @@ def parse_playlist(text, playlist_url):
                 if not segment_url.startswith("#"):
                     segments.append(urljoin(playlist_url, segment_url))
 
-    if is_master: return {"type": "master", "variants": variants, "segments": []}
-    return {"type": "media", "variants": [], "segments": segments}
+    endlist = "#EXT-X-ENDLIST" in lines
+    if is_master: return {"type": "master", "variants": variants, "segments": [], "endlist": endlist}
+    return {"type": "media", "variants": [], "segments": segments, "endlist": endlist}
 
 # ============================================================
 # Browser HLS request
 # ============================================================
 
 async def browser_get_playlist(context, url):
-    log(f"[PLAYLIST] Browser GET: {url}")
+    log(f"[PLAYLIST] Browser GET: {redact_url(url)}")
     try:
         request = await context.request.get(
             url,
@@ -399,7 +446,7 @@ async def browser_get_playlist(context, url):
             timeout=PLAYLIST_TIMEOUT * 1000,
         )
         status = request.status
-        log(f"[PLAYLIST] HTTP {status}: {url}")
+        log(f"[PLAYLIST] HTTP {status}: {redact_url(url)}")
         if status < 200 or status >= 300: return None, status
         text = await request.text()
         log(f"[PLAYLIST] Received {len(text)} bytes")
@@ -470,7 +517,7 @@ async def download_segment(session, url, path, headers):
         timeout = aiohttp.ClientTimeout(total=SEGMENT_TIMEOUT)
         async with session.get(url, headers=headers, timeout=timeout) as response:
             if response.status != 200:
-                log(f"[SEGMENT] HTTP {response.status}: {url}")
+                log(f"[SEGMENT] HTTP {response.status}: {redact_url(url)}")
                 return False, response.status
             data = await response.read()
             if not data: return False, response.status
@@ -487,96 +534,110 @@ async def download_segment(session, url, path, headers):
 # ============================================================
 
 async def record_hls(playwright, context, page, playlist_url, initial_playlist, headers):
-    """
-    ✅ تحسين #3: Session Refresh كل 45 دقيقة لمنع Memory Leak
-    """
     global stop_requested
     log("[RECORDER] Starting HLS recording...")
     SEGMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
     downloaded = set()
     segment_files = []
-    initial_segments = initial_playlist.get("segments", [])
-    log(f"[RECORDER] Initial segments: {len(initial_segments)}")
-
-    timeout = aiohttp.ClientTimeout(total=SEGMENT_TIMEOUT)
-    connector = aiohttp.TCPConnector(limit=10, ssl=False)
-    
     consecutive_playlist_errors = 0
     consecutive_segment_errors = 0
+    heartbeat_failures = 0
     last_status_update = 0
-    last_session_refresh = time.time()  # ✅ جديد: تتبع وقت آخر refresh
+    last_session_refresh = time.time()
+    last_new_segment_time = time.time()
     recording_start_time = time.time()
     start_time_iso = datetime.now(timezone.utc).isoformat()
 
-    await github_update_file(
-        f".recorder/active/{RECORD_ID}.json",
-        {"record_id": RECORD_ID, "url": PAGE_URL, "username": TARGET_USERNAME, "started_at": start_time_iso},
-        f"Start recording {RECORD_ID}"
-    )
+    active_path = f".recorder/active/{RECORD_ID}.json"
+    status_path = f".recorder/status/{RECORD_ID}.json"
+    active_state = {
+        "record_id": RECORD_ID,
+        "url": PAGE_URL,
+        "username": TARGET_USERNAME,
+        "state": "recording",
+        "started_at": start_time_iso,
+        "heartbeat_at": start_time_iso,
+    }
+    if not await github_update_file(active_path, active_state, f"Start recording {RECORD_ID}"):
+        raise RuntimeError("Could not update the pre-reserved recording lease")
 
-    # ✅ جديد: متغير للتحكم في فحص الإيقاف كل 30 ثانية
-    stop_check_counter = 0
+    timeout = aiohttp.ClientTimeout(total=SEGMENT_TIMEOUT)
+    connector = aiohttp.TCPConnector(limit=10)
+
+    async def refresh_session_and_playlist():
+        nonlocal context, page, playlist_url, headers, last_session_refresh
+        log("[SESSION] 🔄 Refreshing browser session and rediscovering HLS...")
+        try:
+            await context.close()
+        except Exception:
+            pass
+        context = await playwright.chromium.new_context(
+            viewport={"width": 1280, "height": 720},
+            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+        )
+        page = await context.new_page()
+        discovered = []
+        async def handle_response(response):
+            try:
+                if is_m3u8(response.url) and response.url not in discovered:
+                    discovered.append(response.url)
+            except Exception:
+                pass
+        page.on("response", handle_response)
+        await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+        for _ in range(10):
+            await inspect_page_for_hls(page, discovered)
+            if discovered:
+                break
+            await asyncio.sleep(1)
+        new_url, new_playlist = await find_live_playlist(context, discovered)
+        if not new_url or not new_playlist:
+            raise RuntimeError("Could not rediscover a usable HLS playlist after session refresh")
+        playlist_url = new_url
+        headers = await build_browser_session(page, context)
+        last_session_refresh = time.time()
+        log(f"[SESSION] ✅ Rediscovered HLS: {redact_url(playlist_url)}")
+        return new_playlist
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while not stop_requested:
-            stop_check_counter += 1
-            
-            # ✅ تحسين #1: فحص الإيقاف كل 10 loops × 3s = 30 ثانية
-            if stop_check_counter % 10 == 0:
-                if await check_stop(): 
-                    break
-            
-            if time.time() - last_status_update > STATUS_UPDATE_INTERVAL:
-                last_status_update = time.time()
-                duration = int(time.time() - recording_start_time)
-                size_bytes = sum(p.stat().st_size for p in segment_files if p.exists())
-                size_mb = size_bytes / 1024 / 1024
-                await github_update_file(
-                    f".recorder/status/{RECORD_ID}.json",
-                    {"record_id": RECORD_ID, "url": PAGE_URL, "username": TARGET_USERNAME, "duration_seconds": duration, "segments_count": len(segment_files), "size_mb": round(size_mb, 2), "hls_status": "recording"},
-                    f"Update status {RECORD_ID}"
-                )
-                try:
-                    video_missing = await page.evaluate("() => !document.querySelector('video')")
-                    if video_missing: log("[RECORDER] Video element missing from page. Possible end/premium.")
-                except Exception: pass
+            elapsed = time.time() - recording_start_time
+            if elapsed >= MAX_RECORDING_SECONDS:
+                log("[RECORDER] ⏱️ Six-hour recording limit reached; stopping safely.")
+                await send_message(f"⏱️ تسجيل {DISPLAY_NAME} وصل إلى حد 6 ساعات وسيتم إنهاؤه بأمان.")
+                break
 
-            # ✅ تحسين #3: إعادة فتح الـ session كل 45 دقيقة
-            if time.time() - last_session_refresh > SESSION_REFRESH_INTERVAL:
-                log(f"[SESSION] 🔄 Refreshing browser session ({SESSION_REFRESH_INTERVAL // 60}min passed)...")
+            if time.time() - last_status_update >= STATUS_UPDATE_INTERVAL:
+                last_status_update = time.time()
+                now_iso = datetime.now(timezone.utc).isoformat()
+                duration = int(elapsed)
+                size_bytes = sum(p.stat().st_size for p in segment_files if p.exists())
+                active_state.update({"state": "recording", "heartbeat_at": now_iso, "duration_seconds": duration, "segments_count": len(segment_files)})
+                if await github_update_file(active_path, active_state, f"Heartbeat {RECORD_ID}"):
+                    heartbeat_failures = 0
+                else:
+                    heartbeat_failures += 1
+                    log(f"[HEARTBEAT] ⚠️ Active lease update failed ({heartbeat_failures}/{HEARTBEAT_FAILURE_LIMIT})")
+                await github_update_file(
+                    status_path,
+                    {"record_id": RECORD_ID, "url": PAGE_URL, "username": TARGET_USERNAME,
+                     "duration_seconds": duration, "segments_count": len(segment_files),
+                     "size_mb": round(size_bytes / 1024 / 1024, 2), "hls_status": "recording",
+                     "heartbeat_at": now_iso},
+                    f"Update status {RECORD_ID}",
+                )
+
+            if await check_stop():
+                break
+
+            if time.time() - last_session_refresh >= SESSION_REFRESH_INTERVAL:
                 try:
-                    # إغلاق المتصفح القديم
-                    try:
-                        await context.close()
-                    except Exception:
-                        pass
-                    
-                    # فتح context جديد
-                    context = await playwright.chromium.new_context(
-                        viewport={"width": 1280, "height": 720},
-                        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                    )
-                    page = await context.new_page()
-                    
-                    # إعادة ربط الـ response handler
-                    async def handle_response(response):
-                        # لا نحتاج لعمل شيء هنا، فقط للحفاظ على الاتصال
-                        pass
-                    page.on("response", handle_response)
-                    
-                    # إعادة فتح الصفحة
-                    try:
-                        await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
-                        last_session_refresh = time.time()
-                        log("[SESSION] ✅ Session refreshed successfully")
-                    except Exception as goto_exc:
-                        log(f"[SESSION] ⚠️ Could not reload page: {goto_exc}")
-                        # الاستمرار بالـ session الجديد حتى لو فشل إعادة التحميل
-                        
+                    await refresh_session_and_playlist()
                 except Exception as exc:
                     log(f"[SESSION] ⚠️ Refresh failed: {exc}")
-                    # الاستمرار بالـ session القديم كـ fallback
+                    last_session_refresh = time.time()
 
             try:
                 current_headers = await build_browser_session(page, context)
@@ -585,76 +646,92 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
                 log(f"[SESSION] Could not refresh headers: {exc}")
 
             playlist_text, status = await browser_get_playlist(context, playlist_url)
-
             if not playlist_text:
                 consecutive_playlist_errors += 1
-                log(f"[RECORDER] Playlist request failed ({consecutive_playlist_errors}/{MAX_PLAYLIST_RETRIES})...")
+                log(f"[RECORDER] Playlist request failed ({consecutive_playlist_errors}/{MAX_PLAYLIST_RETRIES})")
                 if consecutive_playlist_errors >= MAX_PLAYLIST_RETRIES:
-                    log("[RECORDER] Max playlist retries reached. Stopping.")
-                    await send_message(f"⚠️ التسجيل #{RECORD_ID} توقف.\n\nالسبب:\nانتهت محاولات إعادة الاتصال بـ HLS.")
-                    break
+                    try:
+                        await refresh_session_and_playlist()
+                        consecutive_playlist_errors = 0
+                        continue
+                    except Exception as exc:
+                        log(f"[RECORDER] HLS rediscovery failed: {exc}")
+                        await send_message(f"⚠️ تسجيل {DISPLAY_NAME} توقف بعد فقدان HLS المتكرر.")
+                        break
                 await asyncio.sleep(PLAYLIST_POLL_INTERVAL)
                 continue
 
             consecutive_playlist_errors = 0
             parsed = parse_playlist(playlist_text, playlist_url)
-
             if parsed["type"] == "master":
-                variants = parsed["variants"]
-                variants.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
+                variants = sorted(parsed["variants"], key=lambda x: x.get("bandwidth", 0), reverse=True)
                 switched = False
                 for variant in variants:
-                    if await check_stop(): break
                     variant_text, _ = await browser_get_playlist(context, variant["url"])
-                    if not variant_text: continue
+                    if not variant_text:
+                        continue
                     variant_parsed = parse_playlist(variant_text, variant["url"])
                     if variant_parsed["type"] == "media" and variant_parsed["segments"]:
-                        playlist_url = variant["url"]
-                        parsed = variant_parsed
-                        switched = True
+                        playlist_url, parsed, switched = variant["url"], variant_parsed, True
                         break
-                if stop_requested: break
                 if not switched:
                     await asyncio.sleep(PLAYLIST_POLL_INTERVAL)
                     continue
 
+            if parsed.get("endlist"):
+                log("[RECORDER] HLS playlist announced ENDLIST; stream ended normally.")
+                break
+
             segments = parsed.get("segments", [])
             new_segments = [url for url in segments if url not in downloaded]
-            if new_segments: log(f"[RECORDER] New segments: {len(new_segments)}")
+            if new_segments:
+                last_new_segment_time = time.time()
+                log(f"[RECORDER] New segments: {len(new_segments)}")
 
             for segment_url in new_segments:
-                if await check_stop(): break
-
+                if await check_stop():
+                    break
                 segment_number = len(segment_files)
-                filename = f"{segment_number:08d}.ts"
-                path = SEGMENTS_DIR / filename
-
+                path = SEGMENTS_DIR / f"{segment_number:08d}.ts"
                 ok = False
                 seg_status = None
                 for attempt in range(MAX_SEGMENT_RETRIES):
                     ok, seg_status = await download_segment(session, segment_url, path, headers)
-                    if ok: break
+                    if ok:
+                        break
                     await asyncio.sleep(2)
-
                 if ok:
                     consecutive_segment_errors = 0
                     downloaded.add(segment_url)
                     segment_files.append(path)
-                    log(f"[SEGMENT] Saved {filename} ({path.stat().st_size} bytes)")
+                    log(f"[SEGMENT] Saved {path.name} ({path.stat().st_size} bytes)")
                 else:
                     consecutive_segment_errors += 1
-                    log(f"[SEGMENT] Failed after retries: {segment_url} (HTTP {seg_status})")
+                    log(f"[SEGMENT] Failed after retries: {redact_url(segment_url)} (HTTP {seg_status})")
                     if seg_status in (402, 403, 404, 410):
-                        log("[RECORDER] Premium/Ended detected via HTTP status.")
-                        await send_message(f"⚠️ التسجيل #{RECORD_ID} توقف.\n\nالسبب:\nتحول البث إلى خاص (Premium) أو انتهى.")
+                        # A signed CDN URL can expire. Do not call it Premium;
+                        # first obtain a fresh session and playlist.
+                        try:
+                            await refresh_session_and_playlist()
+                            consecutive_segment_errors = 0
+                            break
+                        except Exception as exc:
+                            log(f"[RECORDER] Could not recover HLS after HTTP {seg_status}: {exc}")
+                    if consecutive_segment_errors >= 5:
+                        await send_message(f"⚠️ تسجيل {DISPLAY_NAME} توقف بسبب فشل متكرر في تحميل المقاطع.")
                         stop_requested = True
                         break
-                    if consecutive_segment_errors >= 5:
-                        log("[RECORDER] Too many consecutive segment errors. Stopping.")
-                        await send_message(f"⚠️ التسجيل #{RECORD_ID} توقف.\n\nالسبب:\nفشل متكرر في تحميل المقاطع.")
-                        break
 
-            if await check_stop(): break
+            if stop_requested:
+                break
+            if time.time() - last_new_segment_time >= NO_NEW_SEGMENTS_TIMEOUT:
+                log(f"[RECORDER] No new HLS segments for {NO_NEW_SEGMENTS_TIMEOUT}s; attempting HLS rediscovery.")
+                try:
+                    await refresh_session_and_playlist()
+                    last_new_segment_time = time.time()
+                except Exception as exc:
+                    log(f"[RECORDER] Stream appears ended after rediscovery failed: {exc}")
+                    break
             await asyncio.sleep(PLAYLIST_POLL_INTERVAL)
 
     log(f"[RECORDER] Recording stopped. Segments saved: {len(segment_files)}")
@@ -888,9 +965,9 @@ async def send_video_file(file_path, part_number=None, total_parts=None):
         return False
 
     if TARGET_USERNAME:
-        caption = f"🎥 تسجيل {TARGET_USERNAME} (#{RECORD_ID})\n"
+        caption = f"🎥 تسجيل {DISPLAY_NAME}\n"
     else:
-        caption = f"🎥 التسجيل #{RECORD_ID}\n"
+        caption = f"🎥 تسجيل {DISPLAY_NAME}\n"
         
     if part_number is not None:
         caption += f"Part {part_number}"
@@ -943,8 +1020,8 @@ async def send_recording(output_file, segment_files, duration_seconds):
     if full_size_mb < TELEGRAM_MAX_MB:
         # ✅ تحسين #4: رسالة مفصلة
         await send_message(
-            f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
-            f"👤 {TARGET_USERNAME}\n"
+            f"🎬 اكتمل التسجيل\n"
+            f"👤 {DISPLAY_NAME}\n"
             f"⏱️ المدة: {duration_str}\n"
             f"📦 الحجم: {full_size_mb:.1f} MB\n"
             f"🎞️ المقاطع: {len(segment_files)}\n"
@@ -956,8 +1033,8 @@ async def send_recording(output_file, segment_files, duration_seconds):
 
     # ✅ تحسين #4: رسالة مفصلة للتسجيلات الكبيرة
     await send_message(
-        f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
-        f"👤 {TARGET_USERNAME}\n"
+        f"🎬 اكتمل التسجيل\n"
+        f"👤 {DISPLAY_NAME}\n"
         f"⏱️ المدة: {duration_str}\n"
         f"📦 الحجم الكامل: {full_size_mb:.1f} MB\n"
         f"🎞️ المقاطع: {len(segment_files)}\n"
@@ -970,7 +1047,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
         return False
 
     total_parts = len(parts)
-    await send_message(f"📤 سيتم إرسال {total_parts} فيديوهات بالترتيب.")
+    await send_message(f"📤 سيتم إرسال {total_parts} فيديوهات لتسجيل {DISPLAY_NAME} بالترتيب.")
     all_uploaded = True
 
     for index, part_file in enumerate(parts, start=1):
@@ -989,9 +1066,9 @@ async def send_recording(output_file, segment_files, duration_seconds):
             continue
 
     if all_uploaded:
-        await send_message(f"✅ تم إرسال التسجيل #{RECORD_ID} بالكامل في {total_parts} أجزاء.")
+        await send_message(f"✅ تم إرسال تسجيل {DISPLAY_NAME} بالكامل في {total_parts} أجزاء.")
     else:
-        await send_message(f"⚠️ انتهى إرسال التسجيل #{RECORD_ID}، لكن تعذر إرسال جزء أو أكثر.")
+        await send_message(f"⚠️ انتهى إرسال تسجيل {DISPLAY_NAME}، لكن تعذر إرسال جزء أو أكثر.")
     return all_uploaded
 
 # ============================================================
@@ -999,8 +1076,19 @@ async def send_recording(output_file, segment_files, duration_seconds):
 # ============================================================
 
 async def main():
+    global stop_requested
     if not PAGE_URL:
         print("Usage: python record_once.py \"https://example.com/stream/...\"")
+        return 1
+
+    active_path = f".recorder/active/{RECORD_ID}.json"
+    status_path = f".recorder/status/{RECORD_ID}.json"
+    claim, readable = await github_read_json(active_path)
+    if not readable or not isinstance(claim, dict):
+        await send_message(f"❌ تسجيل {DISPLAY_NAME} لم يجد حجزاً صالحاً؛ تم الإيقاف لمنع تسجيل مكرر.")
+        return 1
+    if str(claim.get("record_id")) != str(RECORD_ID) or str(claim.get("username", "")).lower() != TARGET_USERNAME.lower():
+        await send_message(f"❌ حجز تسجيل {DISPLAY_NAME} غير مطابق للمستخدم؛ تم الإيقاف بأمان.")
         return 1
 
     log("Starting persistent HLS recorder...")
@@ -1014,137 +1102,127 @@ async def main():
     segment_files = []
     start_time_iso = datetime.now(timezone.utc).isoformat()
     recording_start_time = time.time()
+    success = False
 
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-        )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        )
-        page = await context.new_page()
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+            )
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+            )
+            page = await context.new_page()
 
-        async def handle_response(response):
+            async def handle_response(response):
+                try:
+                    if is_m3u8(response.url) and response.url not in discovered:
+                        discovered.append(response.url)
+                        log(f"[HLS] Discovered from network response: {redact_url(response.url)}")
+                except Exception:
+                    pass
+
+            page.on("response", handle_response)
             try:
-                url = response.url
-                if is_m3u8(url):
-                    if url not in discovered:
-                        discovered.append(url)
-                        log(f"[HLS] Discovered from network response: {url}")
-            except Exception: pass
+                await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+            except Exception as exc:
+                log(f"[PAGE] goto warning: {exc}")
 
-        page.on("response", handle_response)
-
-        try:
-            await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
-        except Exception as exc:
-            log(f"[PAGE] goto warning: {exc}")
-
-        discovery_started = time.time()
-        while time.time() - discovery_started < DISCOVERY_TIMEOUT:
-            if await check_stop(): break
+            discovery_started = time.time()
+            while time.time() - discovery_started < DISCOVERY_TIMEOUT:
+                if await check_stop():
+                    break
+                await inspect_page_for_hls(page, discovered)
+                if discovered and time.time() - discovery_started > 5:
+                    break
+                await asyncio.sleep(1)
             await inspect_page_for_hls(page, discovered)
-            if discovered:
-                if time.time() - discovery_started > 5: break
-            await asyncio.sleep(1)
 
-        await inspect_page_for_hls(page, discovered)
-
-        if await check_stop():
-            log("[STOP] Stop requested before recording began.")
-            await browser.close()
-            await send_message(f"⏹️ تم إيقاف التسجيل #{RECORD_ID} قبل بدء تسجيل المقاطع.")
-            await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
-            return 0
-
-        if not discovered:
-            log("[HLS] No HLS playlist discovered.")
-            await send_message("❌ لم يتم اكتشاف رابط HLS للبث.")
-            await browser.close()
-            await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
-            return 1
-
-        log(f"[HLS] Total discovered URLs: {len(discovered)}")
-        playlist_url, playlist = await find_live_playlist(context, discovered)
-
-        if not playlist_url or not playlist:
             if await check_stop():
                 await browser.close()
-                await send_message(f"⏹️ تم إيقاف التسجيل #{RECORD_ID}.")
-                await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
+                await github_delete_file(active_path, f"Remove active {RECORD_ID}")
                 return 0
-            log("[HLS] Discovered URLs were not usable media playlists.")
-            await send_message("❌ تم اكتشاف HLS لكن تعذر الوصول إلى قائمة المقاطع الخاصة بالبث.")
-            await browser.close()
-            await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
-            return 1
 
-        log(f"[HLS] Recording playlist: {playlist_url}")
-        headers = await build_browser_session(page, context)
-        
-        # ✅ تغيير: تمرير playwright بدلاً من context فقط (للـ session refresh)
-        segment_files, start_time_iso, recording_start_time = await record_hls(
-            playwright, context, page, playlist_url, playlist, headers
+            if not discovered:
+                await send_message("❌ لم يتم اكتشاف رابط HLS للبث.")
+                await browser.close()
+                await github_delete_file(active_path, f"Remove active {RECORD_ID}")
+                return 1
+
+            playlist_url, playlist = await find_live_playlist(context, discovered)
+            if not playlist_url or not playlist:
+                await send_message("❌ تم اكتشاف HLS لكن تعذر الوصول إلى قائمة المقاطع الخاصة بالبث.")
+                await browser.close()
+                await github_delete_file(active_path, f"Remove active {RECORD_ID}")
+                return 1
+
+            headers = await build_browser_session(page, context)
+            segment_files, start_time_iso, recording_start_time = await record_hls(
+                playwright, context, page, playlist_url, playlist, headers
+            )
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+        if not segment_files:
+            if stop_requested:
+                await send_message(f"⏹️ تم إيقاف تسجيل {DISPLAY_NAME}، لكن لم يتم تسجيل أي مقطع.")
+            else:
+                await send_message(f"⚠️ تسجيل {DISPLAY_NAME} انتهى دون مقاطع قابلة للحفظ.")
+            return 0
+
+        finalizing_at = datetime.now(timezone.utc).isoformat()
+        await github_update_file(
+            active_path,
+            {**claim, "state": "finalizing", "heartbeat_at": finalizing_at},
+            f"Finalize recording {RECORD_ID}",
         )
 
-        try: await browser.close()
-        except Exception: pass
+        output_file = mux_segments(segment_files)
+        if not output_file:
+            await send_message("❌ فشل إنشاء ملف MP4 بعد انتهاء التسجيل.")
+            return 1
 
-    log("Stopping recorder and preparing final MP4...")
+        duration = int(time.time() - recording_start_time)
+        uploaded = await send_recording(output_file, segment_files, duration)
+        full_size_mb = output_file.stat().st_size / 1024 / 1024 if output_file.exists() else 0
+        parts_count = len(list(PARTS_DIR.glob("*.mp4"))) if PARTS_DIR.exists() else 1
 
-    if not segment_files:
-        log("[MUX] No recorded segments.")
-        if stop_requested:
-            await send_message(f"⏹️ تم إيقاف التسجيل #{RECORD_ID}، لكن لم يتم تسجيل أي مقطع.")
+        await github_update_file(
+            f".recorder/history/{RECORD_ID}.json",
+            {"record_id": RECORD_ID, "url": PAGE_URL, "username": TARGET_USERNAME,
+             "started_at": start_time_iso, "ended_at": datetime.now(timezone.utc).isoformat(),
+             "duration_seconds": duration, "size_mb": round(full_size_mb, 2),
+             "parts_count": parts_count, "status": "success" if uploaded else "failed"},
+            f"History {RECORD_ID}",
+        )
+        success = uploaded
+        if uploaded:
+            try:
+                if WORK_DIR.exists():
+                    shutil.rmtree(WORK_DIR)
+                    log("[CLEANUP] Workspace cleaned.")
+            except Exception as exc:
+                log(f"[CLEANUP] Error: {exc}")
+            await send_message(
+                f"{'⏹️ تم إيقاف' if stop_requested else '✅ انتهى'} تسجيل {DISPLAY_NAME} "
+                "وتم إرسال التسجيل بنجاح."
+            )
         else:
-            await send_message("❌ لم يتم تسجيل أي جزء من البث.")
-        await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
-        await github_delete_file(f".recorder/status/{RECORD_ID}.json", f"Remove status {RECORD_ID}")
+            await send_message(f"⚠️ انتهى تسجيل {DISPLAY_NAME}، لكن تعذر إرسال التسجيل بالكامل.")
+            return 1
         return 0
-
-    output_file = mux_segments(segment_files)
-    if not output_file:
-        await send_message("❌ فشل إنشاء ملف MP4 بعد انتهاء التسجيل.")
-        await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
-        await github_delete_file(f".recorder/status/{RECORD_ID}.json", f"Remove status {RECORD_ID}")
+    except Exception as exc:
+        log(f"[FATAL] Recorder exception: {type(exc).__name__}: {exc}")
+        await send_message(f"❌ حدث خطأ أثناء تسجيل {DISPLAY_NAME}.")
         return 1
-
-    duration = int(time.time() - recording_start_time)
-    
-    # ✅ تغيير: تمرير duration إلى send_recording
-    uploaded = await send_recording(output_file, segment_files, duration)
-
-    full_size_mb = output_file.stat().st_size / 1024 / 1024 if output_file and output_file.exists() else 0
-    parts_count = len(list(PARTS_DIR.glob("*.mp4"))) if PARTS_DIR.exists() else 1
-
-    await github_update_file(
-        f".recorder/history/{RECORD_ID}.json",
-        {"record_id": RECORD_ID, "url": PAGE_URL, "username": TARGET_USERNAME, "started_at": start_time_iso, "ended_at": datetime.now(timezone.utc).isoformat(), "duration_seconds": duration, "size_mb": round(full_size_mb, 2), "parts_count": parts_count, "status": "success" if uploaded else "failed"},
-        f"History {RECORD_ID}"
-    )
-
-    await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
-    await github_delete_file(f".recorder/status/{RECORD_ID}.json", f"Remove status {RECORD_ID}")
-
-    if uploaded:
-        try:
-            if WORK_DIR.exists():
-                shutil.rmtree(WORK_DIR)
-                log("[CLEANUP] Workspace cleaned.")
-        except Exception as e:
-            log(f"[CLEANUP] Error: {e}")
-            
-        if stop_requested:
-            await send_message(f"⏹️ تم إيقاف التسجيل #{RECORD_ID} وإرسال التسجيل بنجاح.")
-        else:
-            await send_message(f"✅ انتهى التسجيل #{RECORD_ID} وتم إرسال التسجيل بنجاح.")
-    else:
-        await send_message(f"⚠️ انتهى التسجيل #{RECORD_ID}، لكن تعذر إرسال التسجيل بالكامل.")
-        return 1
-
-    return 0
+    finally:
+        await github_delete_file(active_path, f"Remove active {RECORD_ID}")
+        await github_delete_file(status_path, f"Remove status {RECORD_ID}")
 
 # ============================================================
 # Entrypoint
