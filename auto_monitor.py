@@ -36,6 +36,7 @@ GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "kalausr8")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "telegram-hls-recorder")
 
 WATCHLIST_PATH = ".recorder/config/watchlist.json"
+IDENTITY_PATH = ".recorder/config/identities.json"
 
 # Maximum number of users checked concurrently.
 # This is NOT the recording limit.
@@ -45,7 +46,14 @@ MAX_CONCURRENT_USERS = 5
 MAX_TOTAL_RECORDINGS = 5
 
 # Maximum time spent waiting for stream/API evidence per user.
-MAX_WAIT_SECONDS = 8.0
+MAX_WAIT_SECONDS = 12.0
+
+# Diagnostic mode: NEVER dispatch recordings from this run.
+# The purpose is to observe Tango network behaviour safely.
+DIAGNOSTIC_ONLY = False
+
+# Maximum number of diagnostic entries printed per user for noisy traffic.
+MAX_DIAGNOSTIC_NETWORK_LOGS = 80
 
 # Poll interval while waiting for network evidence.
 POLL_INTERVAL = 0.5
@@ -53,6 +61,7 @@ POLL_INTERVAL = 0.5
 # Safety settings.
 MAX_RECORDING_AGE_HOURS = 6
 MAX_STATUS_STALE_MINUTES = 10
+MALFORMED_LEASE_GRACE_MINUTES = 30
 
 
 # ============================================================
@@ -63,6 +72,8 @@ class StreamStatus:
     OFFLINE = "OFFLINE"
     LIVE_NORMAL = "LIVE_NORMAL"
     LIVE_PREMIUM = "LIVE_PREMIUM"
+    UNKNOWN = "UNKNOWN"
+    ERROR = "ERROR"
 
 
 # ============================================================
@@ -176,6 +187,33 @@ async def github_get_file(path):
         return None
 
 
+async def github_update_file(path, content, message):
+    write_token = PAT_TOKEN or GITHUB_TOKEN
+    if not write_token:
+        return False
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
+    headers = {"Authorization": f"Bearer {write_token}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "telegram-hls-recorder-monitor"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            sha = None
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    sha = (await resp.json()).get("sha")
+                elif resp.status != 404:
+                    return False
+            raw = json.dumps(content, ensure_ascii=False, indent=2) + "\n"
+            body = {"message": message, "content": base64.b64encode(raw.encode()).decode()}
+            if sha: body["sha"] = sha
+            async with session.put(url, headers=headers, json=body) as resp:
+                if resp.status not in (200, 201):
+                    log(f"[GITHUB] Update failed for {path}: HTTP {resp.status}")
+                    return False
+                return True
+    except Exception as exc:
+        log(f"[GITHUB] Update exception for {path}: {type(exc).__name__}: {exc}")
+        return False
+
+
 async def github_get_file_last_commit_time(path):
     if not GITHUB_TOKEN:
         return None
@@ -282,111 +320,108 @@ async def github_delete_file(path, message):
         log(f"[GITHUB] Exception deleting {path}: {exc}")
 
 
-async def is_recording_actually_alive(record_id, started_at_str):
-    if started_at_str:
-        try:
-            start_time = datetime.fromisoformat(
-                started_at_str.replace("Z", "+00:00")
-            )
+async def is_recording_actually_alive(record_data):
+    """Fail closed: malformed leases are counted as active, never ignored."""
+    if not isinstance(record_data, dict):
+        return True
 
-            age = datetime.now(timezone.utc) - start_time
-            age_hours = age.total_seconds() / 3600
+    record_id = str(record_data.get("record_id") or "UNKNOWN")
+    state = str(record_data.get("state") or "unknown").lower()
+    started_at_str = record_data.get("started_at") or record_data.get("claimed_at") or ""
+    heartbeat_str = record_data.get("heartbeat_at") or record_data.get("claimed_at") or started_at_str
 
-            if age_hours > MAX_RECORDING_AGE_HOURS:
-                log(
-                    f"[VERIFY] ❌ {record_id}: "
-                    f"File too old ({age_hours:.1f}h > "
-                    f"{MAX_RECORDING_AGE_HOURS}h)"
-                )
-                return False
+    if not record_data.get("username") or not record_data.get("record_id"):
+        log(f"[VERIFY] ⚠️ {record_id}: malformed lease -> KEEPING ACTIVE")
+        return True
 
-        except Exception as exc:
+    try:
+        start_time = datetime.fromisoformat(
+            str(started_at_str).replace("Z", "+00:00")
+        )
+        age_hours = (
+            datetime.now(timezone.utc) - start_time
+        ).total_seconds() / 3600
+        if age_hours > MAX_RECORDING_AGE_HOURS:
             log(
-                f"[VERIFY] ⚠️ {record_id}: "
-                f"Error parsing started_at: {exc}"
+                f"[VERIFY] ❌ {record_id}: lease older than "
+                f"{MAX_RECORDING_AGE_HOURS}h -> removable"
             )
+            return False
+    except Exception:
+        log(f"[VERIFY] ⚠️ {record_id}: invalid timestamp -> KEEPING ACTIVE")
+        return True
 
+    try:
+        heartbeat_time = datetime.fromisoformat(
+            str(heartbeat_str).replace("Z", "+00:00")
+        )
+        stale_minutes = (
+            datetime.now(timezone.utc) - heartbeat_time
+        ).total_seconds() / 60
+    except Exception:
+        log(f"[VERIFY] ⚠️ {record_id}: invalid heartbeat -> KEEPING ACTIVE")
+        return True
+
+    if state == "starting":
+        # A recent starting lease is a real reservation even if the
+        # recorder has not created its status file yet.
+        if stale_minutes <= 15:
+            log(f"[VERIFY] ✅ {record_id}: STARTING lease fresh ({stale_minutes:.1f}m)")
+            return True
+
+        log(f"[VERIFY] 🗑️ {record_id}: abandoned STARTING lease ({stale_minutes:.1f}m)")
+        return False
+
+    if stale_minutes <= MAX_STATUS_STALE_MINUTES:
+        log(
+            f"[VERIFY] ✅ {record_id}: {state.upper()} heartbeat fresh "
+            f"({stale_minutes:.1f}m)"
+        )
+        return True
+
+    # Conservative safety rule: never free a slot solely because a
+    # GitHub status commit is stale or missing.
     status_path = f".recorder/status/{record_id}.json"
     status_data = await github_get_file(status_path)
 
     if status_data is None:
-        if started_at_str:
-            try:
-                start_time = datetime.fromisoformat(
-                    started_at_str.replace("Z", "+00:00")
-                )
-
-                age_minutes = (
-                    datetime.now(timezone.utc) - start_time
-                ).total_seconds() / 60
-
-                if age_minutes < 2:
-                    log(
-                        f"[VERIFY] ✅ {record_id}: "
-                        f"Just started ({age_minutes:.1f}m ago), "
-                        "no status yet - OK"
-                    )
-                    return True
-
-            except Exception:
-                pass
-
         log(
-            f"[VERIFY] ❌ {record_id}: "
-            "No status file found - recording likely stopped"
-        )
-        return False
-
-    last_commit_time = await github_get_file_last_commit_time(
-        status_path
-    )
-
-    if last_commit_time is None:
-        log(
-            f"[VERIFY] ⚠️ {record_id}: "
-            "Cannot check status freshness - keeping as active"
+            f"[VERIFY] ⚠️ {record_id}: heartbeat stale and status unavailable "
+            "-> KEEPING ACTIVE"
         )
         return True
 
-    stale_minutes = (
+    last_commit_time = await github_get_file_last_commit_time(status_path)
+    if last_commit_time is None:
+        log(
+            f"[VERIFY] ⚠️ {record_id}: cannot verify status freshness "
+            "-> KEEPING ACTIVE"
+        )
+        return True
+
+    status_stale_minutes = (
         datetime.now(timezone.utc) - last_commit_time
     ).total_seconds() / 60
 
-    if stale_minutes > MAX_STATUS_STALE_MINUTES:
+    if status_stale_minutes <= MAX_STATUS_STALE_MINUTES:
         log(
-            f"[VERIFY] ❌ {record_id}: "
-            f"Status stale ({stale_minutes:.1f}m > "
-            f"{MAX_STATUS_STALE_MINUTES}m) - recording stopped"
+            f"[VERIFY] ✅ {record_id}: status commit fresh "
+            f"({status_stale_minutes:.1f}m)"
         )
-        return False
+        return True
 
     log(
-        f"[VERIFY] ✅ {record_id}: "
-        f"Status fresh ({stale_minutes:.1f}m ago) - recording alive"
+        f"[VERIFY] ⚠️ {record_id}: heartbeat/status stale "
+        f"({status_stale_minutes:.1f}m) -> KEEPING ACTIVE"
     )
-
     return True
 
 
 async def github_get_active_recordings():
-    """
-    Return the genuinely active recordings.
-
-    Result:
-        [
-            {
-                "username": "...",
-                "record_id": "...",
-                "path": "..."
-            },
-            ...
-        ]
-    """
-
+    """Read active leases and fail closed on malformed/unknown state."""
     url = (
         f"https://api.github.com/repos/"
-        f"{GITHUB_OWNER}/{GITHUB_REPO}/git/trees/main"
-        f"?recursive=1"
+        f"{GITHUB_OWNER}/{GITHUB_REPO}/git/trees/main?recursive=1"
     )
 
     headers = {
@@ -395,31 +430,28 @@ async def github_get_active_recordings():
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "telegram-hls-recorder-monitor",
     }
-
     timeout = aiohttp.ClientTimeout(total=15)
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, headers=headers) as resp:
-
                 if resp.status != 200:
                     log(
                         "[GITHUB] Failed to read repository tree: "
-                        f"HTTP {resp.status}"
+                        f"HTTP {resp.status} -> ABORTING active-state trust"
                     )
-                    return []
+                    # Fail closed: do not claim capacity when state cannot
+                    # be read. Returning synthetic active slots prevents any
+                    # new dispatches in the main loop.
+                    return None
 
                 data = await resp.json()
-
                 tree = data.get("tree", [])
-
                 active_files = [
-                    file_info
-                    for file_info in tree
-                    if file_info["path"].startswith(
-                        ".recorder/active/"
-                    )
-                    and file_info["path"].endswith(".json")
+                    item for item in tree
+                    if isinstance(item, dict)
+                    and str(item.get("path", "")).startswith(".recorder/active/")
+                    and str(item.get("path", "")).endswith(".json")
                 ]
 
                 if not active_files:
@@ -427,75 +459,75 @@ async def github_get_active_recordings():
                     return []
 
                 log(
-                    f"[MONITOR] Found {len(active_files)} active file(s), "
-                    "verifying..."
+                    f"[MONITOR] Found {len(active_files)} active lease(s), verifying..."
                 )
 
                 active_recordings = []
 
                 for file_info in active_files:
-
                     path = file_info["path"]
-
                     file_data = await github_get_file(path)
 
-                    if not file_data or "username" not in file_data:
+                    if not isinstance(file_data, dict):
+                        record_id = Path(path).stem
+                        status_data = await github_get_file(f".recorder/status/{record_id}.json")
+                        status_fresh = False
+                        if isinstance(status_data, dict):
+                            heartbeat = status_data.get("heartbeat_at") or status_data.get("updated_at")
+                            if heartbeat:
+                                try:
+                                    age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))).total_seconds() / 60
+                                    status_fresh = age <= MAX_STATUS_STALE_MINUTES
+                                except Exception:
+                                    pass
+                        commit_time = await github_get_file_last_commit_time(path)
+                        lease_age = None
+                        if commit_time:
+                            lease_age = (datetime.now(timezone.utc) - commit_time).total_seconds() / 60
+                        if not status_fresh and lease_age is not None and lease_age > MALFORMED_LEASE_GRACE_MINUTES:
+                            log(f"[VERIFY] 🗑️ {record_id}: malformed/orphaned lease older than {MALFORMED_LEASE_GRACE_MINUTES}m -> cleanup")
+                            await github_delete_file(path, f"Cleanup orphaned malformed lease {record_id}")
+                            await github_delete_file(f".recorder/status/{record_id}.json", f"Cleanup orphaned status {record_id}")
+                            continue
+                        log(f"[VERIFY] ⚠️ {record_id}: malformed lease -> KEEPING ACTIVE")
+                        active_recordings.append({
+                            "username": f"unknown:{record_id}".lower(),
+                            "record_id": record_id,
+                            "path": path,
+                        })
                         continue
 
-                    record_id = file_data.get(
-                        "record_id",
-                        "UNKNOWN",
-                    )
-
-                    started_at = file_data.get(
-                        "started_at",
-                        "",
-                    )
-
-                    username = file_data["username"]
-
-                    is_alive = await is_recording_actually_alive(
-                        record_id,
-                        started_at,
-                    )
+                    is_alive = await is_recording_actually_alive(file_data)
 
                     if is_alive:
-                        active_recordings.append(
-                            {
-                                "username": username.lower(),
-                                "record_id": record_id,
-                                "path": path,
-                            }
-                        )
-
+                        username = str(file_data.get("username") or f"unknown:{Path(path).stem}")
+                        record_id = str(file_data.get("record_id") or Path(path).stem)
+                        active_recordings.append({
+                            "username": username.lower(),
+                            "record_id": record_id,
+                            "path": path,
+                        })
                         log(
-                            f"[MONITOR] ✅ {username} is genuinely "
-                            f"recording (#{record_id})"
+                            f"[MONITOR] ✅ active lease: {username} "
+                            f"(#{record_id})"
                         )
-
                     else:
-                        log(
-                            f"[MONITOR] 🗑️ {username} recording is dead, "
-                            f"cleaning up (#{record_id})..."
-                        )
-
-                        await github_delete_file(
-                            path,
-                            f"Cleanup dead recording {record_id}",
-                        )
-
+                        record_id = str(file_data.get("record_id") or Path(path).stem)
+                        log(f"[MONITOR] 🗑️ abandoned lease #{record_id}: cleaning up")
+                        await github_delete_file(path, f"Cleanup abandoned lease {record_id}")
                         await github_delete_file(
                             f".recorder/status/{record_id}.json",
-                            f"Cleanup dead status {record_id}",
+                            f"Cleanup abandoned status {record_id}",
                         )
 
                 return active_recordings
 
     except Exception as exc:
         log(
-            f"[GITHUB] Exception getting active recordings: {exc}"
+            f"[GITHUB] Exception getting active recordings: "
+            f"{type(exc).__name__}: {exc} -> ABORTING capacity decisions"
         )
-        return []
+        return None
 
 
 # Backwards-compatible helper for code that only needs usernames.
@@ -524,7 +556,7 @@ def generate_record_id():
     )
 
 
-async def trigger_recording(stream_url, username):
+async def trigger_recording(stream_url, username, display_name="", account_id=""):
     if not PAT_TOKEN:
         log(
             "[GITHUB] Cannot trigger recording: "
@@ -551,12 +583,31 @@ async def trigger_recording(stream_url, username):
 
     record_id = generate_record_id()
 
+    # Reserve the slot BEFORE repository_dispatch so another monitor run
+    # cannot start a duplicate recording during GitHub Actions startup.
+    lease = {
+        "record_id": record_id,
+        "url": stream_url,
+        "username": username,
+        "display_name": display_name or username,
+        "account_id": account_id,
+        "state": "starting",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+    }
+    lease_path = f".recorder/active/{record_id}.json"
+    if not await github_update_file(lease_path, lease, f"Reserve recording {record_id}"):
+        log(f"[GITHUB] ❌ Could not reserve lease for {record_id}; dispatch cancelled")
+        return False
+
     body = {
         "event_type": "telegram_record",
         "client_payload": {
             "url": stream_url,
             "record_id": record_id,
             "username": username,
+            "display_name": display_name or username,
+            "account_id": account_id,
         },
     }
 
@@ -578,7 +629,7 @@ async def trigger_recording(stream_url, username):
 
                     await send_message(
                         f"🔴 Auto-Record: بدأ تشغيل تسجيل "
-                        f"{username} تلقائياً! (#{record_id})"
+                        f"{display_name or username} تلقائياً!"
                     )
 
                     return True
@@ -589,14 +640,14 @@ async def trigger_recording(stream_url, username):
                     f"[GITHUB] Trigger failed: "
                     f"HTTP {resp.status} - {text[:500]}"
                 )
-
+                await github_delete_file(lease_path, f"Remove failed reservation {record_id}")
                 return False
 
     except Exception as exc:
         log(
             f"[GITHUB] Exception triggering recording: {exc}"
         )
-
+        await github_delete_file(lease_path, f"Remove failed reservation {record_id}")
         return False
 
 
@@ -736,6 +787,233 @@ def is_premium_stream(stream_data, details_data):
 
 
 # ============================================================
+# Identity / username tracking
+# ============================================================
+
+def extract_username_from_url(url):
+    try:
+        from urllib.parse import urlsplit, unquote
+        parts = [x for x in unquote(urlsplit(url).path).split("/") if x]
+        return parts[0] if len(parts) == 1 else ""
+    except Exception:
+        return ""
+
+def extract_username_from_title(title):
+    import re
+    match = re.search(r"\(@([A-Za-z0-9._-]+)\)", title or "")
+    return match.group(1) if match else ""
+
+def parse_display_name(title, username):
+    title = (title or "").strip()
+    marker = f"(@{username})"
+    pos = title.lower().find(marker.lower())
+    if pos >= 0:
+        value = title[:pos].strip().rstrip("-").strip()
+        if value: return value
+    if " - Tango Live" in title:
+        value = title.split(" - Tango Live", 1)[0].strip()
+        if value: return value
+    return username
+
+def identity_aliases(identity):
+    if not isinstance(identity, dict): return []
+    values = [identity.get("username"), *(identity.get("aliases") or [])]
+    out=[]
+    for v in values:
+        v=str(v or "").strip().lower()
+        if v and v not in out: out.append(v)
+    return out
+
+def merge_identity(identities, old_username, observed, now_iso):
+    key=old_username.lower()
+    old=identities.get(key) if isinstance(identities.get(key),dict) else {}
+    old_name=str(old.get("username") or old_username)
+    new_name=str(observed.get("username") or old_username).strip()
+    aliases=identity_aliases(old)
+    for v in (old_username,old_name,new_name):
+        if v and v.lower() not in aliases: aliases.append(v.lower())
+    changed=bool(old.get("username")) and old_name.lower()!=new_name.lower()
+    rec={"username":new_name,"display_name":str(observed.get("display_name") or old.get("display_name") or new_name),"account_id":str(observed.get("account_id") or old.get("account_id") or ""),"aliases":aliases,"first_seen_at":old.get("first_seen_at") or now_iso,"last_seen_at":now_iso,"username_changed_at":now_iso if changed else old.get("username_changed_at"),"username_change_window_days":90}
+    if changed:
+        rec["previous_username"]=old_name
+        log(f"[IDENTITY] 🔄 {old_name} -> {new_name} ({rec['display_name']})")
+    return rec
+
+def display_label(identity, username):
+    if isinstance(identity,dict) and str(identity.get("display_name") or "").strip(): return str(identity["display_name"]).strip()
+    return username
+
+
+# ============================================================
+# Diagnostic helpers
+# ============================================================
+
+DIAGNOSTIC_PATH_KEYWORDS = (
+    "/api/",
+    "graphql",
+    "live",
+    "stream",
+    "broadcast",
+    "room",
+    "watch",
+    "player",
+    "playback",
+    "manifest",
+    "playlist",
+    ".m3u8",
+    ".mpd",
+    "websocket",
+)
+
+
+def redact_network_url(url):
+    """Return a safe URL containing scheme/host/path only."""
+    try:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+        return f"{parts.scheme}://{parts.netloc}{parts.path}"
+    except Exception:
+        return str(url).split("?", 1)[0].split("#", 1)[0]
+
+
+def compact_value(value, max_len=220):
+    try:
+        text = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception:
+        text = repr(value)
+
+    if len(text) > max_len:
+        return text[:max_len] + "..."
+    return text
+
+
+def collect_interesting_keys(value, prefix="", depth=0, limit=40):
+    """Return key paths only; never return values/tokens."""
+    found = []
+    if depth > 5:
+        return found
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            found.append(path)
+            if len(found) >= limit:
+                return found
+            found.extend(
+                collect_interesting_keys(
+                    child,
+                    path,
+                    depth + 1,
+                    max(0, limit - len(found)),
+                )
+            )
+            if len(found) >= limit:
+                return found[:limit]
+
+    elif isinstance(value, list):
+        for child in value[:5]:
+            found.extend(
+                collect_interesting_keys(
+                    child,
+                    prefix + "[]" if prefix else "[]",
+                    depth + 1,
+                    max(0, limit - len(found)),
+                )
+            )
+            if len(found) >= limit:
+                return found[:limit]
+
+    return found[:limit]
+
+
+def find_stream_objects(value, depth=0):
+    """Recursively find dicts whose keys strongly resemble stream data."""
+    if depth > 6:
+        return []
+
+    matches = []
+
+    if isinstance(value, dict):
+        keys = {str(k).lower() for k in value.keys()}
+        score = 0
+        for key in (
+            "stream",
+            "streamid",
+            "stream_id",
+            "broadcast",
+            "broadcastid",
+            "broadcast_id",
+            "live",
+            "is_live",
+            "islive",
+            "playback",
+            "playlist",
+            "hls",
+            "m3u8",
+        ):
+            if key in keys:
+                score += 1
+
+        if score >= 1:
+            matches.append(value)
+
+        for child in value.values():
+            matches.extend(find_stream_objects(child, depth + 1))
+
+    elif isinstance(value, list):
+        for child in value[:20]:
+            matches.extend(find_stream_objects(child, depth + 1))
+
+    return matches
+
+
+def object_has_live_signal(obj):
+    if not isinstance(obj, dict):
+        return False
+
+    true_values = {"true", "yes", "live", "online", "broadcasting", "active"}
+
+    for key in (
+        "isLive",
+        "is_live",
+        "live",
+        "online",
+        "broadcasting",
+        "active",
+    ):
+        if key not in obj:
+            continue
+        value = obj.get(key)
+        if isinstance(value, bool) and value:
+            return True
+        if isinstance(value, str) and value.strip().lower() in true_values:
+            return True
+
+    for key in (
+        "stream",
+        "streamId",
+        "stream_id",
+        "broadcast",
+        "broadcastId",
+        "broadcast_id",
+        "playback",
+        "playlist",
+        "hls",
+        "m3u8",
+    ):
+        if key in obj and obj.get(key) not in (None, "", [], {}):
+            return True
+
+    return False
+
+
+# ============================================================
 # Playwright Monitor
 # ============================================================
 
@@ -743,235 +1021,287 @@ async def check_user_live_status(browser, username):
     profile_url = f"https://www.tango.me/{username}"
     start_time = time.time()
 
-    log(
-        f"[MONITOR] [{username}] Checking at {profile_url}"
-    )
+    log(f"[MONITOR] [{username}] Checking at {profile_url}")
 
     context = await browser.new_context(
-        viewport={
-            "width": 1280,
-            "height": 720,
-        },
+        viewport={"width": 1280, "height": 720},
         user_agent=(
             "Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/128.0.0.0 Safari/537.36"
         ),
     )
-
     page = await context.new_page()
 
-    stream_info = {
-        "status": StreamStatus.OFFLINE,
-        "stream_url": None,
-        "stream_id": None,
-
-        # m3u8 is evidence of a live stream, but it is not
-        # allowed to permanently override a later Premium API result.
+    info = {
         "m3u8_seen": False,
-
-        # Whether Tango's watch API returned a stream object.
         "api_stream_seen": False,
-
-        # Whether the API explicitly classified the stream as Premium.
         "api_premium": False,
-
-        # Whether the API explicitly classified the stream as normal.
         "api_normal": False,
+        "page_status": None,
+        "page_title": "",
+        "response_count": 0,
+        "interesting_responses": 0,
+        "diagnostic_logs": 0,
+        "api_candidates": 0,
+        "json_candidates": 0,
+        "errors": [],
+        "hls_url": None,
+        "account_id": None,
     }
+
+    seen_paths = set()
+
+    def diag_allowed():
+        return info["diagnostic_logs"] < MAX_DIAGNOSTIC_NETWORK_LOGS
+
+    async def inspect_json_response(response, safe_url):
+        """Inspect JSON structure without logging response values."""
+        try:
+            content_type = (response.headers.get("content-type") or "").lower()
+            if "json" not in content_type:
+                return
+
+            info["json_candidates"] += 1
+            data = await response.json()
+            keys = collect_interesting_keys(data)
+
+            stream_objects = find_stream_objects(data)
+            live_signal = any(
+                object_has_live_signal(obj)
+                for obj in stream_objects
+            )
+
+            if stream_objects:
+                info["api_candidates"] += 1
+
+            if diag_allowed() and (
+                live_signal
+                or any(
+                    token in safe_url.lower()
+                    for token in ("live", "stream", "broadcast", "room", "watch", "graphql")
+                )
+            ):
+                info["diagnostic_logs"] += 1
+                log(
+                    f"[DIAG] [{username}] JSON "
+                    f"HTTP={response.status} CT={content_type.split(';', 1)[0]} "
+                    f"URL={safe_url}"
+                )
+                log(
+                    f"[DIAG] [{username}] JSON keys={compact_value(keys, 500)} "
+                    f"stream_objects={len(stream_objects)} live_signal={live_signal}"
+                )
+
+            for obj in stream_objects:
+                details = obj.get("details") if isinstance(obj, dict) else None
+                stream = obj.get("stream") if isinstance(obj, dict) else None
+
+                if isinstance(details, dict) and isinstance(details.get("stream"), dict):
+                    stream = details.get("stream")
+
+                if isinstance(stream, dict):
+                    info["api_stream_seen"] = True
+                    stream_id = stream.get("id") or stream.get("streamId") or stream.get("stream_id")
+                    info["account_id"] = stream.get("encryptedAccountId") or stream.get("encrypted_account_id") or info.get("account_id")
+                    master_url = stream.get("masterListUrl") or stream.get("master_list_url")
+                    if isinstance(master_url, str) and ".m3u8" in master_url.lower(): info["hls_url"] = master_url
+                    if stream_id and diag_allowed():
+                        info["diagnostic_logs"] += 1
+                        log(f"[DIAG] [{username}] stream object detected; id_present=yes")
+
+                    if is_premium_stream(stream, details if isinstance(details, dict) else obj):
+                        info["api_premium"] = True
+                        info["api_normal"] = False
+                        if diag_allowed():
+                            info["diagnostic_logs"] += 1
+                            log(f"[DIAG] [{username}] EXPLICIT PREMIUM signal found in JSON")
+                        return
+
+                    if object_has_live_signal(stream) or object_has_live_signal(obj):
+                        info["api_normal"] = True
+
+                elif object_has_live_signal(obj):
+                    info["api_normal"] = True
+
+        except Exception as exc:
+            if diag_allowed():
+                info["diagnostic_logs"] += 1
+                log(f"[DIAG] [{username}] JSON inspection failed: {type(exc).__name__}: {exc}")
 
     async def handle_response(response):
         try:
+            info["response_count"] += 1
             url = response.url
+            safe_url = redact_network_url(url)
+            lower_url = safe_url.lower()
+            content_type = (response.headers.get("content-type") or "").lower()
 
-            # ----------------------------------------------------
-            # Tango watch API
-            # ----------------------------------------------------
+            interesting = (
+                ".m3u8" in lower_url
+                or ".mpd" in lower_url
+                or any(token in lower_url for token in DIAGNOSTIC_PATH_KEYWORDS)
+            )
 
-            if (
-                "proxycador/api/public/v1/live/stream/v2/watch"
-                in url
-            ):
-                if response.status == 200:
+            if interesting:
+                info["interesting_responses"] += 1
+                path_key = f"{response.status}|{content_type.split(';', 1)[0]}|{safe_url}"
 
-                    try:
-                        data = await response.json()
+                if path_key not in seen_paths and diag_allowed():
+                    seen_paths.add(path_key)
+                    info["diagnostic_logs"] += 1
+                    log(
+                        f"[DIAG] [{username}] RESPONSE "
+                        f"HTTP={response.status} "
+                        f"CT={content_type.split(';', 1)[0] or '-'} "
+                        f"URL={safe_url}"
+                    )
 
-                        if not isinstance(data, dict):
-                            return
+            if ".m3u8" in lower_url:
+                info["m3u8_seen"] = True
+                info["hls_url"] = info.get("hls_url") or url
+                if diag_allowed():
+                    info["diagnostic_logs"] += 1
+                    log(f"[DIAG] [{username}] HLS manifest candidate detected")
 
-                        body = data.get("body")
+            # Inspect every JSON response whose path looks relevant,
+            # plus the known Tango watch endpoint.
+            if "json" in content_type and interesting:
+                await inspect_json_response(response, safe_url)
 
-                        if not isinstance(body, dict):
-                            return
-
-                        details = body.get("details")
-
-                        if not isinstance(details, dict):
-                            return
-
-                        stream = details.get("stream")
-
-                        if not isinstance(stream, dict):
-                            return
-
-                        stream_info["api_stream_seen"] = True
-                        stream_info["stream_id"] = stream.get("id")
-
-                        # Premium has priority over every other
-                        # stream signal.
-                        if is_premium_stream(
-                            stream,
-                            details,
-                        ):
-                            stream_info["api_premium"] = True
-                            stream_info["api_normal"] = False
-                            stream_info["status"] = (
-                                StreamStatus.LIVE_PREMIUM
-                            )
-
-                            log(
-                                f"[MONITOR] [{username}] "
-                                "🟡 PREMIUM detected via API"
-                            )
-
-                        else:
-                            stream_info["api_normal"] = True
-
-                            # Only classify as normal here if
-                            # Premium was not explicitly detected.
-                            if not stream_info["api_premium"]:
-                                stream_info["status"] = (
-                                    StreamStatus.LIVE_NORMAL
-                                )
-                                stream_info["stream_url"] = (
-                                    profile_url
-                                )
-
-                                log(
-                                    f"[MONITOR] [{username}] "
-                                    "✅ NORMAL live detected via API"
-                                )
-
-                    except Exception as exc:
-                        log(
-                            f"[MONITOR] [{username}] "
-                            f"Watch API parse error: {exc}"
-                        )
-
-            # ----------------------------------------------------
-            # HLS m3u8
-            # ----------------------------------------------------
-
-            if ".m3u8" in url.lower():
-
-                stream_info["m3u8_seen"] = True
-
-                log(
-                    f"[MONITOR] [{username}] "
-                    "m3u8 detected"
-                )
-
-                # m3u8 confirms that a stream resource exists,
-                # but if Premium has already been confirmed,
-                # NEVER downgrade it to Normal.
-                if not stream_info["api_premium"]:
-                    stream_info["stream_url"] = profile_url
-
-                    # This is provisional evidence.
-                    # Final classification is resolved after
-                    # the observation window.
-                    if stream_info["status"] == StreamStatus.OFFLINE:
-                        stream_info["status"] = (
-                            StreamStatus.LIVE_NORMAL
-                        )
+            # Known endpoint: keep an explicit diagnostic line even if
+            # Tango returns an error/non-JSON response.
+            if "proxycador/api/public/v1/live/stream/v2/watch" in lower_url:
+                if diag_allowed():
+                    info["diagnostic_logs"] += 1
+                    log(
+                        f"[DIAG] [{username}] KNOWN WATCH ENDPOINT "
+                        f"HTTP={response.status} CT={content_type.split(';', 1)[0] or '-'}"
+                    )
+                if "json" in content_type:
+                    await inspect_json_response(response, safe_url)
 
         except Exception as exc:
-            log(
-                f"[MONITOR] [{username}] "
-                f"Response handler error: {exc}"
-            )
+            if diag_allowed():
+                info["diagnostic_logs"] += 1
+                log(f"[DIAG] [{username}] Response handler error: {type(exc).__name__}: {exc}")
 
     page.on("response", handle_response)
 
     try:
-        await page.goto(
+        response = await page.goto(
             profile_url,
             wait_until="domcontentloaded",
             timeout=30000,
         )
 
-        # Encourage the player to initialize.
+        if response is not None:
+            info["page_status"] = response.status
+
         try:
-            await page.mouse.move(100, 100)
-            await asyncio.sleep(0.5)
+            info["page_title"] = await page.title()
         except Exception:
             pass
 
-        max_iterations = int(
-            MAX_WAIT_SECONDS / POLL_INTERVAL
+        log(
+            f"[DIAG] [{username}] PAGE "
+            f"HTTP={info['page_status']} title={info['page_title'][:120]!r}"
         )
 
-        for _ in range(max_iterations):
+        # Give Tango JS a chance to initialize. Also perform a small,
+        # harmless scroll to trigger lazy-loaded player components.
+        try:
+            await page.mouse.move(640, 360)
+            await page.mouse.wheel(0, 450)
+            await asyncio.sleep(1.0)
+            await page.mouse.wheel(0, -450)
+        except Exception:
+            pass
 
+        deadline = time.monotonic() + MAX_WAIT_SECONDS
+
+        while time.monotonic() < deadline:
             await asyncio.sleep(POLL_INTERVAL)
 
-            # Premium is terminal and has priority.
-            if stream_info["api_premium"]:
+            if info["api_premium"]:
                 break
 
-            # An explicit normal API result is strong enough to
-            # finish early.
-            if stream_info["api_normal"]:
-                break
-
-            # m3u8 alone remains provisional. We intentionally
-            # continue observing until the normal timeout so that
-            # a Premium API response has an opportunity to arrive.
-            #
-            # Therefore there is intentionally NO early exit here
-            # merely because m3u8 was seen.
+            if info["api_normal"]:
+                # Do not stop immediately in diagnostic mode. We want
+                # to capture whether another endpoint later says Premium.
+                if not DIAGNOSTIC_ONLY:
+                    break
 
     except Exception as exc:
-        log(
-            f"[MONITOR] [{username}] Error: {exc}"
-        )
+        info["errors"].append(f"{type(exc).__name__}: {exc}")
+        log(f"[DIAG] [{username}] PAGE ERROR: {type(exc).__name__}: {exc}")
 
     finally:
-        await context.close()
+        # A final snapshot of the rendered DOM is useful for diagnosing
+        # bot/challenge/player failures, but we never log its contents.
+        try:
+            body_text = await page.locator("body").inner_text(timeout=1000)
+            normalized = " ".join(body_text.split()).lower()
+            markers = []
+            for marker in (
+                "captcha",
+                "verify you are human",
+                "access denied",
+                "unusual traffic",
+                "robot",
+                "sign in",
+                "log in",
+            ):
+                if marker in normalized:
+                    markers.append(marker)
+            if markers:
+                log(f"[DIAG] [{username}] PAGE MARKERS={markers}")
+        except Exception:
+            pass
 
-    # ------------------------------------------------------------
-    # Final classification
-    # ------------------------------------------------------------
+        try:
+            await context.close()
+        except Exception:
+            pass
 
-    if stream_info["api_premium"]:
+    final_url = info.get("hls_url")
+    if info["api_premium"]:
         final_status = StreamStatus.LIVE_PREMIUM
         final_url = None
-
-    elif stream_info["api_normal"]:
+    elif info["api_normal"] and final_url:
         final_status = StreamStatus.LIVE_NORMAL
-        final_url = profile_url
-
-    elif stream_info["m3u8_seen"]:
-        # No explicit Premium API evidence was received during
-        # the observation window. m3u8 is therefore accepted as
-        # live-stream evidence.
+    elif info["m3u8_seen"] and final_url:
         final_status = StreamStatus.LIVE_NORMAL
-        final_url = profile_url
-
+    elif info["errors"]:
+        final_status = StreamStatus.ERROR
+        final_url = None
     else:
         final_status = StreamStatus.OFFLINE
         final_url = None
 
+    resolved_username = extract_username_from_url(page.url) or extract_username_from_title(info.get("page_title", "")) or username
+    identity = {
+        "username": resolved_username,
+        "display_name": parse_display_name(info.get("page_title", ""), resolved_username),
+        "account_id": str(info.get("account_id") or ""),
+    }
+
+
     elapsed = time.time() - start_time
 
     log(
-        f"[MONITOR] [{username}] Completed in "
-        f"{elapsed:.1f}s: status={final_status}"
+        f"[DIAG] [{username}] SUMMARY "
+        f"status={final_status} page_http={info['page_status']} "
+        f"responses={info['response_count']} "
+        f"interesting={info['interesting_responses']} "
+        f"json={info['json_candidates']} "
+        f"stream_objects={info['api_stream_seen']} "
+        f"m3u8={info['m3u8_seen']} "
+        f"premium={info['api_premium']} normal_signal={info['api_normal']} "
+        f"elapsed={elapsed:.1f}s"
     )
 
-    return final_status, final_url
+    return final_status, final_url, identity
 
 
 # ============================================================
@@ -1019,6 +1349,8 @@ async def main():
         watchlist.append(username)
 
     total_watchlist = len(watchlist)
+    identities = await github_get_file(IDENTITY_PATH)
+    if not isinstance(identities, dict): identities = {}
 
     if total_watchlist == 0:
         log("[MONITOR] Watchlist contains no valid usernames")
@@ -1034,10 +1366,19 @@ async def main():
 
     active_recordings = await github_get_active_recordings()
 
-    active_usernames = {
-        recording["username"].lower()
-        for recording in active_recordings
-    }
+    if active_recordings is None:
+        log("[MONITOR] ❌ Active-state read failed. No recordings will be dispatched in this run.")
+        await send_message(
+            "⚠️ تعذر قراءة حالة التسجيلات الحالية من GitHub، لذلك لم يتم تشغيل أي تسجيل جديد حفاظاً على حد 5 تسجيلات."
+        )
+        return 1
+
+    active_usernames = set()
+    for recording in active_recordings:
+        ru = str(recording.get("username") or "").lower()
+        if ru: active_usernames.add(ru)
+        for alias in identity_aliases(identities.get(ru)):
+            active_usernames.add(alias)
 
     active_count = len(active_recordings)
 
@@ -1086,6 +1427,8 @@ async def main():
         "offline": 0,
         "live_normal": 0,
         "live_premium": 0,
+        "unknown": 0,
+        "errors": 0,
     }
 
     # This is separate from classification.
@@ -1117,12 +1460,12 @@ async def main():
         async def check_with_semaphore(username):
             async with semaphore:
                 try:
-                    status, url = await check_user_live_status(
+                    status, url, identity = await check_user_live_status(
                         browser,
                         username,
                     )
 
-                    return username, status, url
+                    return username, status, url, identity
 
                 except Exception as exc:
                     log(
@@ -1130,15 +1473,7 @@ async def main():
                         f"{username}: {exc}"
                     )
 
-                    # An unexpected check failure is kept as
-                    # OFFLINE for backward compatibility.
-                    # It is still counted, so the summary remains
-                    # internally consistent.
-                    return (
-                        username,
-                        StreamStatus.OFFLINE,
-                        None,
-                    )
+                    return (username, StreamStatus.ERROR, None, {"username": username, "display_name": username, "account_id": ""})
 
         log(
             f"[MONITOR] Starting concurrent check for "
@@ -1168,8 +1503,10 @@ async def main():
     # ------------------------------------------------------------
 
     normal_results = []
+    identity_updates = {}
 
-    for username, status, stream_url in results:
+    for username, status, stream_url, identity in results:
+        identity_updates[username] = identity
 
         if status == StreamStatus.LIVE_NORMAL:
             stats["live_normal"] += 1
@@ -1184,6 +1521,12 @@ async def main():
         elif status == StreamStatus.LIVE_PREMIUM:
             stats["live_premium"] += 1
 
+        elif status == StreamStatus.UNKNOWN:
+            stats["unknown"] += 1
+
+        elif status == StreamStatus.ERROR:
+            stats["errors"] += 1
+
         else:
             stats["offline"] += 1
 
@@ -1192,6 +1535,8 @@ async def main():
         stats["live_normal"]
         + stats["live_premium"]
         + stats["offline"]
+        + stats["unknown"]
+        + stats["errors"]
     )
 
     if classified_count != len(users_to_check):
@@ -1217,9 +1562,68 @@ async def main():
     )
     log("=" * 60)
 
+    # Persist identities and migrate usernames when Tango exposes a new canonical URL.
+    now_iso = datetime.now(timezone.utc).isoformat()
+    migrated_watchlist = list(watchlist)
+    renamed = False
+    for old_username, observed in identity_updates.items():
+        merged = merge_identity(identities, old_username, observed, now_iso)
+        identities[old_username.lower()] = merged
+        new_username = str(merged.get("username") or old_username).strip()
+        identities[new_username.lower()] = merged
+        for i, current in enumerate(migrated_watchlist):
+            if current.lower() == old_username.lower() and new_username.lower() != current.lower():
+                migrated_watchlist[i] = new_username
+                renamed = True
+    if identity_updates:
+        await github_update_file(IDENTITY_PATH, identities, "Update Tango identity map")
+    if renamed:
+        seen=set(); deduped=[]
+        for value in migrated_watchlist:
+            if value.lower() not in seen:
+                seen.add(value.lower()); deduped.append(value)
+        await github_update_file(WATCHLIST_PATH, deduped, "Update watchlist after Tango username change")
+        watchlist=deduped
+        log("[IDENTITY] ✅ watchlist migrated to current Tango usernames")
+
     # ------------------------------------------------------------
     # RECORDING CAPACITY PHASE
     # ------------------------------------------------------------
+
+    if DIAGNOSTIC_ONLY:
+        log("[MONITOR] 🔎 DIAGNOSTIC_ONLY=True: no repository_dispatch will be sent.")
+        available_slots = max(0, MAX_TOTAL_RECORDINGS - active_count)
+        recordings_triggered = 0
+        recordings_failed = 0
+        recordings_blocked_by_limit = 0
+
+        log("=" * 60)
+        log("Diagnostic classification completed:")
+        log(f"  - Normal Live: {stats['live_normal']}")
+        log(f"  - Premium Live: {stats['live_premium']}")
+        log(f"  - Offline: {stats['offline']}")
+        log(f"  - Unknown: {stats['unknown']}")
+        log(f"  - Errors: {stats['errors']}")
+        log(f"  - Checked: {len(users_to_check)}")
+        log("=" * 60)
+
+        elapsed_total = time.time() - start_time
+        summary = (
+            f"🔎 Diagnostic Auto-Monitor انتهى في {elapsed_total:.1f} ثانية.\n\n"
+            f"📊 القائمة: {total_watchlist}\n"
+            f"• قيد التسجيل: {skipped_active_count}\n"
+            f"• تم فحصه: {len(users_to_check)}\n\n"
+            f"📈 النتائج التشخيصية:\n"
+            f"• 🟢 Normal: {stats['live_normal']}\n"
+            f"• 🟡 Premium: {stats['live_premium']}\n"
+            f"• ⚪ Offline: {stats['offline']}\n"
+            f"• ❓ Unknown: {stats['unknown']}\n"
+            f"• ❌ Errors: {stats['errors']}\n\n"
+            "🛑 لم يتم تشغيل أي تسجيل في الوضع التشخيصي.\n"
+            "راجع سجلات [DIAG] لمعرفة API/HLS الفعلي الذي يراه Chromium."
+        )
+        await send_message(summary)
+        return 0
 
     available_slots = max(
         0,
@@ -1269,9 +1673,11 @@ async def main():
             "Starting recording..."
         )
 
+        identity = identity_updates.get(username) or identities.get(username.lower()) or {}
         success = await trigger_recording(
-            stream_url,
-            username,
+            stream_url, username,
+            display_label(identity, username),
+            str(identity.get("account_id") or ""),
         )
 
         if success:
@@ -1340,6 +1746,16 @@ async def main():
     )
 
     log(
+        f"  - Unknown: "
+        f"{stats['unknown']}"
+    )
+
+    log(
+        f"  - Errors: "
+        f"{stats['errors']}"
+    )
+
+    log(
         f"  - Existing active recordings: "
         f"{active_count}"
     )
@@ -1404,7 +1820,17 @@ async def main():
 
     summary += (
         f"• ⚪ غير متصل: "
-        f"{stats['offline']}\n\n"
+        f"{stats['offline']}\n"
+    )
+
+    summary += (
+        f"• ❓ غير محسوم: "
+        f"{stats['unknown']}\n"
+    )
+
+    summary += (
+        f"• ❌ أخطاء: "
+        f"{stats['errors']}\n\n"
     )
 
     # ------------------------------------------------------------
