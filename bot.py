@@ -1,245 +1,504 @@
-import asyncio, base64, json, os, re, secrets, string
-from datetime import datetime, timezone
-from urllib.parse import urlsplit, unquote
+import os
+import re
+import signal
+import asyncio
+import subprocess
+from pathlib import Path
+from dataclasses import dataclass
 
-import aiohttp
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 from playwright.async_api import async_playwright
 
-BOT_TOKEN=os.environ["BOT_TOKEN"]
-ADMIN_USER_ID=int(os.environ["ADMIN_USER_ID"])
-GITHUB_TOKEN=os.environ.get("PAT_TOKEN") or os.environ.get("GITHUB_TOKEN","")
-GITHUB_OWNER=os.environ.get("GITHUB_OWNER","kalausr8")
-GITHUB_REPO=os.environ.get("GITHUB_REPO","telegram-hls-recorder")
-GITHUB_BRANCH=os.environ.get("GITHUB_BRANCH","main")
-WATCHLIST_PATH=".recorder/config/watchlist.json"
-IDENTITY_PATH=".recorder/config/identities.json"
-ACTIVE_DIR=".recorder/active"
-STOP_DIR=".recorder/stop"
-MAX_RECORDINGS=5
-state_lock=asyncio.Lock()
 
-def now_iso(): return datetime.now(timezone.utc).isoformat()
-def norm(v): return (v or "").strip().lstrip("@")
-def valid(v): return bool(v and len(v)<=80 and re.fullmatch(r"[A-Za-z0-9._-]+",v))
-def rid(): return "".join(secrets.choice(string.ascii_uppercase+string.digits) for _ in range(6))
-def auth(u): return bool(u.effective_user and u.effective_user.id==ADMIN_USER_ID)
-async def deny(u):
-    if u.message: await u.message.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
-def headers(): return {"Authorization":f"Bearer {GITHUB_TOKEN}","Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28","User-Agent":"telegram-hls-recorder-bot"}
-def ghurl(p): return f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{p}"
-async def gh_get(p):
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
-        async with s.get(ghurl(p),headers=headers(),params={"ref":GITHUB_BRANCH}) as r:
-            if r.status==404:return None,None
-            if r.status!=200: raise RuntimeError(f"GitHub GET {p}: HTTP {r.status}")
-            d=await r.json(); c=d.get("content")
-            if not c: raise RuntimeError(f"GitHub file {p} has no content")
-            return json.loads(base64.b64decode(c.replace("\n","")).decode("utf-8","replace")),d.get("sha")
-async def gh_put(p,obj,msg,retries=3):
-    raw=base64.b64encode((json.dumps(obj,ensure_ascii=False,indent=2)+"\n").encode()).decode()
-    for attempt in range(retries):
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
-            async with s.get(ghurl(p),headers=headers(),params={"ref":GITHUB_BRANCH}) as r:
-                if r.status==200: sha=(await r.json()).get("sha")
-                elif r.status==404: sha=None
-                else: raise RuntimeError(f"GitHub GET before PUT: HTTP {r.status}")
-            body={"message":msg,"content":raw,"branch":GITHUB_BRANCH}
-            if sha: body["sha"]=sha
-            async with s.put(ghurl(p),headers=headers(),json=body) as r:
-                if r.status in (200,201): return True
-                if r.status==409 and attempt<retries-1:
-                    await asyncio.sleep(.7*(attempt+1)); continue
-                raise RuntimeError(f"GitHub PUT {p}: HTTP {r.status}")
-    return False
-async def gh_delete(p,msg):
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
-        async with s.get(ghurl(p),headers=headers(),params={"ref":GITHUB_BRANCH}) as r:
-            if r.status==404:return False
-            if r.status!=200: raise RuntimeError(f"GitHub GET delete: HTTP {r.status}")
-            sha=(await r.json()).get("sha")
-        if not sha:return False
-        async with s.delete(ghurl(p),headers=headers(),json={"message":msg,"sha":sha,"branch":GITHUB_BRANCH}) as r:
-            if r.status in (200,204,404):return r.status!=404
-            raise RuntimeError(f"GitHub DELETE {p}: HTTP {r.status}")
-async def gh_tree():
-    u=f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/git/trees/{GITHUB_BRANCH}?recursive=1"
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
-        async with s.get(u,headers=headers()) as r:
-            if r.status!=200:raise RuntimeError(f"GitHub tree: HTTP {r.status}")
-            return (await r.json()).get("tree",[])
-def aliases(x):
-    if not isinstance(x,dict):return []
-    vals=[x.get("username"),*(x.get("aliases") or []),x.get("previous_username")]; out=[]
-    for v in vals:
-        v=str(v or "").strip().lower()
-        if v and v not in out:out.append(v)
-    return out
-def label(x,fallback):
-    return str(x.get("display_name") or fallback).strip() if isinstance(x,dict) else fallback
-def username_from_url(u):
-    try:
-        p=[x for x in unquote(urlsplit(u).path).split("/") if x]
-        return p[0] if len(p)==1 else ""
-    except:return ""
-def username_from_title(t):
-    m=re.search(r"\(@([A-Za-z0-9._-]+)\)",t or ""); return m.group(1) if m else ""
-def display_from_title(t,u):
-    t=(t or "").strip(); m=f"(@{u})"; i=t.lower().find(m.lower())
-    if i>=0:
-        v=t[:i].strip().rstrip("-").strip()
-        if v:return v
-    if " - Tango Live" in t:
-        v=t.split(" - Tango Live",1)[0].strip()
-        if v:return v
-    return u
-async def resolve(username):
-    try:
-        async with async_playwright() as p:
-            b=await p.chromium.launch(headless=True,args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"])
-            c=await b.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36")
-            page=await c.new_page(); r=await page.goto(f"https://www.tango.me/{username}",wait_until="domcontentloaded",timeout=30000)
-            t=await page.title(); u=username_from_url(page.url) or username_from_title(t) or username
-            await c.close(); await b.close()
-            return u,display_from_title(t,u),""
-    except Exception:return username,username,""
-async def load_watch():
-    d,_=await gh_get(WATCHLIST_PATH); out=[];seen=set()
-    for v in d if isinstance(d,list) else []:
-        v=norm(str(v))
-        if valid(v) and v.lower() not in seen:out.append(v);seen.add(v.lower())
-    return out
-async def load_ids():
-    d,_=await gh_get(IDENTITY_PATH); return d if isinstance(d,dict) else {}
-async def save_identity(u,name,account=""):
-    ids=await load_ids(); old=ids.get(u.lower()) if isinstance(ids.get(u.lower()),dict) else {}; a=aliases(old)
-    if u.lower() not in a:a.append(u.lower())
-    ids[u.lower()]={"username":u,"display_name":name or u,"account_id":account or old.get("account_id","") ,"aliases":a,"first_seen_at":old.get("first_seen_at",now_iso()),"last_seen_at":now_iso(),"username_changed_at":old.get("username_changed_at"),"username_change_window_days":90}
-    await gh_put(IDENTITY_PATH,ids,f"Save identity {u}")
-async def active():
-    out=[]
-    for x in await gh_tree():
-        p=str(x.get("path",""))
-        if p.startswith(ACTIVE_DIR+"/") and p.endswith(".json"):
-            d,_=await gh_get(p)
-            if isinstance(d,dict):out.append(d)
-    return out
-async def dispatch(url,u,name,account=""):
-    async with state_lock:
-        a=await active()
-        if len(a)>=MAX_RECORDINGS:return None,"limit"
-        ids=await load_ids(); wanted=set(aliases(ids.get(u.lower(),{})))|{u.lower()}
-        for r in a:
-            au=str(r.get("username") or "").lower(); ra=set(aliases(ids.get(au,{})))|{au}
-            if wanted & ra:return None,"already_recording"
-        record=rid(); lease={"record_id":record,"url":url,"username":u,"display_name":name or u,"account_id":account or "","state":"starting","started_at":now_iso(),"heartbeat_at":now_iso()}; lp=f"{ACTIVE_DIR}/{record}.json"
-        await gh_put(lp,lease,f"Reserve recording {record}")
-        body={"event_type":"telegram_record","client_payload":{"url":url,"record_id":record,"username":u,"display_name":name or u,"account_id":account or ""}}
-        du=f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/dispatches"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
+
+MAX_RECORDINGS = 5
+WORK_DIR = Path("/tmp/hls-recordings")
+WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass
+class Recording:
+    number: int
+    page_url: str
+    m3u8_url: str
+    process: asyncio.subprocess.Process
+    output: Path
+
+
+recordings: dict[int, Recording] = {}
+next_number = 1
+
+
+def authorized(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and user.id == ADMIN_USER_ID)
+
+
+async def deny(update: Update):
+    if update.message:
+        await update.message.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
+
+
+async def find_m3u8(page_url: str):
+    found = []
+    headers = {}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            executable_path="/usr/bin/chromium",
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+
+        context = await browser.new_context(
+            ignore_https_errors=True
+        )
+
+        page = await context.new_page()
+
+        async def on_request(request):
+            url = request.url.lower()
+
+            if ".m3u8" in url:
+                if request.url not in found:
+                    found.append(request.url)
+
+                    if not headers:
+                        headers.update({
+                            "User-Agent": request.headers.get(
+                                "user-agent", ""
+                            ),
+                            "Referer": request.headers.get(
+                                "referer", page_url
+                            ),
+                            "Origin": request.headers.get(
+                                "origin", ""
+                            ),
+                        })
+
+        page.on("request", on_request)
+
+        await page.goto(
+            page_url,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+
+        # Give the player time to start requesting the HLS playlist.
+        await page.wait_for_timeout(10000)
+
+        # Try common HTML5/video player play mechanisms.
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
-                async with s.post(du,headers=headers(),json=body) as r:
-                    if r.status==204:return record,"started"
-                    await gh_delete(lp,f"Remove failed reservation {record}"); return None,f"github_error:{r.status}"
-        except Exception as e:
-            try:await gh_delete(lp,f"Remove failed reservation {record}")
-            except Exception:pass
-            return None,f"dispatch_exception:{type(e).__name__}"
-async def start_cmd(u,c):
-    if not auth(u):return await deny(u)
-    await u.message.reply_text("🎥 HLS Auto Recorder جاهز.\n\n/Addwatch username\n/Removewatch username\n/Watchlist\n/List\n/Stop id|username\n/Stopall\n/Record رابط_البث")
-async def add_cmd(u,c):
-    if not auth(u):return await deny(u)
-    if not c.args:return await u.message.reply_text("الاستخدام:\n/Addwatch username")
-    x=norm(c.args[0])
-    if not valid(x):return await u.message.reply_text("❌ username غير صالح.")
+            await page.locator("video").first.evaluate(
+                """video => {
+                    video.muted = true;
+                    video.play().catch(() => {});
+                }"""
+            )
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(10000)
+
+        cookies = await context.cookies()
+
+        await browser.close()
+
+    if not found:
+        return None, None, None
+
+    # Prefer master playlists when several playlists were detected.
+    selected = found[0]
+
+    for url in found:
+        if "master" in url.lower():
+            selected = url
+            break
+
+    cookie_header = "; ".join(
+        f"{c['name']}={c['value']}" for c in cookies
+    )
+
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+
+    return selected, headers, cookies
+
+
+def build_ffmpeg_command(
+    m3u8_url: str,
+    headers: dict,
+    output: Path,
+):
+    header_lines = []
+
+    for key in ("User-Agent", "Referer", "Origin", "Cookie"):
+        value = headers.get(key)
+
+        if value:
+            header_lines.append(f"{key}: {value}")
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "10",
+
+        "-headers",
+        "".join(f"{line}\r\n" for line in header_lines),
+
+        "-i",
+        m3u8_url,
+
+        "-map",
+        "0",
+        "-c",
+        "copy",
+
+        "-movflags",
+        "+faststart",
+
+        str(output),
+    ]
+
+    return command
+
+
+async def send_finished_file(
+    context: ContextTypes.DEFAULT_TYPE,
+    recording: Recording,
+):
+    if not recording.output.exists():
+        return
+
+    size = recording.output.stat().st_size
+
+    # Telegram Bot API currently has a 50 MB limit for bot file uploads.
+    if size > 49 * 1024 * 1024:
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=(
+                f"⚠️ التسجيل #{recording.number} انتهى.\n"
+                f"حجم الملف: {size / 1024 / 1024:.1f} MB\n"
+                "الملف أكبر من الحد المسموح به للإرسال المباشر عبر Bot API."
+            ),
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=ADMIN_USER_ID,
+        text=f"📤 إرسال التسجيل #{recording.number}..."
+    )
+
+    with recording.output.open("rb") as video:
+        await context.bot.send_document(
+            chat_id=ADMIN_USER_ID,
+            document=video,
+            filename=recording.output.name,
+        )
+
     try:
-        async with state_lock:
-            w=await load_watch(); nu,name,acc=await resolve(x)
-            w=[v for v in w if v.lower()!=x.lower()]
-            if nu.lower() not in {v.lower() for v in w}:w.append(nu)
-            await gh_put(WATCHLIST_PATH,w,f"Add watchlist {nu}"); await save_identity(nu,name,acc)
-        await u.message.reply_text(f"✅ تمت الإضافة.\n\n👤 {name}\n🔗 @{nu}\n🧠 سيتم تتبع تغيّر الـusername تلقائياً.")
-    except Exception as e:await u.message.reply_text(f"❌ تعذر تحديث القائمة.\n{type(e).__name__}")
-async def remove_cmd(u,c):
-    if not auth(u):return await deny(u)
-    if not c.args:return await u.message.reply_text("الاستخدام:\n/Removewatch username")
-    q=" ".join(c.args).strip().lower()
+        recording.output.unlink()
+    except Exception:
+        pass
+
+
+async def monitor_recording(
+    context: ContextTypes.DEFAULT_TYPE,
+    recording: Recording,
+):
+    process = recording.process
+
+    await process.wait()
+
+    recordings.pop(recording.number, None)
+
+    if process.returncode == 0:
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=f"✅ انتهى التسجيل #{recording.number}."
+        )
+
+        await send_finished_file(context, recording)
+
+    else:
+        if recording.output.exists() and recording.output.stat().st_size > 0:
+            await context.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    f"⚠️ توقف التسجيل #{recording.number}، "
+                    "وسأحاول إرسال الملف الناتج."
+                ),
+            )
+            await send_finished_file(context, recording)
+        else:
+            await context.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=f"❌ فشل التسجيل #{recording.number}."
+            )
+
+
+async def record_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    global next_number
+
+    if not authorized(update):
+        await deny(update)
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "الاستخدام:\n/record https://example.com/stream/123"
+        )
+        return
+
+    if len(recordings) >= MAX_RECORDINGS:
+        await update.message.reply_text(
+            f"⚠️ وصلت إلى الحد الأقصى: {MAX_RECORDINGS} تسجيلات."
+        )
+        return
+
+    page_url = context.args[0].strip()
+
+    if not re.match(r"^https?://", page_url, re.I):
+        await update.message.reply_text("❌ الرابط غير صالح.")
+        return
+
+    number = next_number
+    next_number += 1
+
+    await update.message.reply_text(
+        f"🔎 التسجيل #{number}\n"
+        "جارٍ فتح صفحة البث واكتشاف HLS..."
+    )
+
     try:
-        async with state_lock:
-            w=await load_watch(); ids=await load_ids(); target=None
-            for x in w:
-                z=ids.get(x.lower(),{})
-                if q==x.lower() or q in aliases(z) or q==str(z.get("display_name") or "").lower():target=x;break
-            if not target:return await u.message.reply_text("❌ لم أجد هذا المستخدم.")
-            await gh_put(WATCHLIST_PATH,[x for x in w if x.lower()!=target.lower()],f"Remove watchlist {target}")
-        await u.message.reply_text(f"🗑️ تمت إزالة {target} من قائمة المراقبة.")
-    except Exception as e:await u.message.reply_text(f"❌ تعذر تحديث القائمة.\n{type(e).__name__}")
-async def watch_cmd(u,c):
-    if not auth(u):return await deny(u)
+        m3u8_url, headers, _ = await find_m3u8(page_url)
+
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ تعذر فتح الصفحة أو اكتشاف البث.\n"
+            f"{type(exc).__name__}"
+        )
+        return
+
+    if not m3u8_url:
+        await update.message.reply_text(
+            "❌ لم يتم العثور على رابط HLS/m3u8 في الصفحة."
+        )
+        return
+
+    output = WORK_DIR / f"recording_{number}.mp4"
+
+    command = build_ffmpeg_command(
+        m3u8_url,
+        headers or {},
+        output,
+    )
+
     try:
-        w=await load_watch(); ids=await load_ids()
-        if not w:return await u.message.reply_text("📭 قائمة المراقبة فارغة.")
-        lines=[f"📋 قائمة المراقبة ({len(w)}):\n"]
-        for i,x in enumerate(w,1):
-            z=ids.get(x.lower(),{}); n=label(z,x); prev=str(z.get("previous_username") or "").strip(); extra=f"\n   ↳ سابقاً: @{prev}" if prev and prev.lower()!=x.lower() else ""
-            lines.append(f"{i}. {n}\n   @{x}{extra}")
-        text="\n\n".join(lines)
-        for i in range(0,len(text),3900):await u.message.reply_text(text[i:i+3900])
-    except Exception as e:await u.message.reply_text(f"❌ تعذر قراءة القائمة.\n{type(e).__name__}")
-async def list_cmd(u,c):
-    if not auth(u):return await deny(u)
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ تعذر تشغيل FFmpeg.\n{type(exc).__name__}"
+        )
+        return
+
+    recording = Recording(
+        number=number,
+        page_url=page_url,
+        m3u8_url=m3u8_url,
+        process=process,
+        output=output,
+    )
+
+    recordings[number] = recording
+
+    await update.message.reply_text(
+        f"🔴 بدأ التسجيل #{number}\n\n"
+        f"يمكنك إيقافه بواسطة:\n"
+        f"/stop {number}"
+    )
+
+    asyncio.create_task(
+        monitor_recording(context, recording)
+    )
+
+
+async def stop_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not authorized(update):
+        await deny(update)
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "الاستخدام:\n/stop 1"
+        )
+        return
+
     try:
-        a=await active();ids=await load_ids()
-        if not a:return await u.message.reply_text("📭 لا توجد تسجيلات نشطة.")
-        lines=[f"🔴 التسجيلات النشطة ({len(a)}/{MAX_RECORDINGS}):\n"]
-        for r in a:
-            un=str(r.get("username") or ""); n=label(r, label(ids.get(un.lower(),{}),un or "غير معروف")); lines.append(f"👤 {n}\n🔴 الحالة: {r.get('state','unknown')}\n🆔 المعرّف الداخلي: {r.get('record_id','')}\n🔗 @{un}")
-        await u.message.reply_text("\n\n".join(lines))
-    except Exception as e:await u.message.reply_text(f"❌ تعذر قراءة التسجيلات.\n{type(e).__name__}")
-def match(r,q,ids):
-    q=q.lower(); un=str(r.get("username") or "").lower(); return q in {str(r.get("record_id") or "").lower(),un,str(r.get("display_name") or "").lower()} or q in aliases(ids.get(un,{}))
-async def stop_cmd(u,c):
-    if not auth(u):return await deny(u)
-    if not c.args:return await u.message.reply_text("الاستخدام:\n/Stop id\nأو\n/Stop username")
+        number = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ رقم تسجيل غير صالح.")
+        return
+
+    recording = recordings.get(number)
+
+    if not recording:
+        await update.message.reply_text(
+            f"❌ لا يوجد تسجيل نشط برقم {number}."
+        )
+        return
+
+    await update.message.reply_text(
+        f"⏹️ إيقاف التسجيل #{number} وإنهاء ملف MP4..."
+    )
+
     try:
-        a=await active();ids=await load_ids();m=[r for r in a if match(r," ".join(c.args).strip(),ids)]
-        if not m:return await u.message.reply_text("❌ لم أجد تسجيلًا نشطًا مطابقًا.")
-        if len(m)>1:return await u.message.reply_text("⚠️ يوجد أكثر من تسجيل مطابق. استخدم المعرّف الداخلي الظاهر في /List.")
-        r=m[0];record=str(r.get("record_id"));un=str(r.get("username") or "");name=label(r,label(ids.get(un.lower(),{}),un)); sig={"record_id":record,"username":un,"stop":True,"requested_at":now_iso()}
-        await gh_put(f"{STOP_DIR}/{record}",sig,f"Request stop {record}"); await u.message.reply_text(f"⏹️ تم إرسال إشارة إيقاف {name} بنجاح.")
-    except Exception as e:await u.message.reply_text(f"❌ تعذر إرسال إشارة الإيقاف.\n{type(e).__name__}")
-async def stopall_cmd(u,c):
-    if not auth(u):return await deny(u)
-    try:
-        a=await active()
-        if not a:return await u.message.reply_text("📭 لا توجد تسجيلات نشطة.")
-        n=0
-        for r in a:
-            record=str(r.get("record_id") or "")
-            if not record:continue
-            try:await gh_put(f"{STOP_DIR}/{record}",{"record_id":record,"username":r.get("username",""),"stop":True,"requested_at":now_iso()},f"Request stop {record}");n+=1
-            except Exception:pass
-        await u.message.reply_text(f"⏹️ تم إرسال إشارات الإيقاف لـ {n} تسجيلات.")
-    except Exception as e:await u.message.reply_text(f"❌ تعذر إيقاف الجميع.\n{type(e).__name__}")
-async def record_cmd(u,c):
-    if not auth(u):return await deny(u)
-    if not c.args:return await u.message.reply_text("الاستخدام:\n/Record https://www.tango.me/username")
-    url=c.args[0].strip()
-    if not re.match(r"^https?://",url,re.I):return await u.message.reply_text("❌ الرابط غير صالح.")
-    un=username_from_url(url) or "manual"; ids=await load_ids(); z=ids.get(un.lower(),{}); name=label(z,un)
-    try:
-        record,result=await dispatch(url,un,name,str(z.get("account_id") or ""))
-        if result=="limit":return await u.message.reply_text(f"⛔ وصلت التسجيلات إلى الحد الأقصى ({MAX_RECORDINGS}).")
-        if result=="already_recording":return await u.message.reply_text(f"⚠️ {name} لديه تسجيل نشط بالفعل.")
-        if not record:return await u.message.reply_text(f"❌ تعذر تشغيل التسجيل.\n{result}")
-        await u.message.reply_text(f"🔴 بدأ طلب تسجيل {name}.\nسيتم تشغيل المسجل عبر GitHub Actions.")
-    except Exception as e:await u.message.reply_text(f"❌ تعذر بدء التسجيل.\n{type(e).__name__}")
+        recording.process.send_signal(signal.SIGINT)
+    except Exception:
+        try:
+            recording.process.terminate()
+        except Exception:
+            pass
+
+
+async def stop_all_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not authorized(update):
+        await deny(update)
+        return
+
+    if not recordings:
+        await update.message.reply_text(
+            "لا توجد تسجيلات نشطة."
+        )
+        return
+
+    count = len(recordings)
+
+    for recording in list(recordings.values()):
+        try:
+            recording.process.send_signal(signal.SIGINT)
+        except Exception:
+            try:
+                recording.process.terminate()
+            except Exception:
+                pass
+
+    await update.message.reply_text(
+        f"⏹️ جارٍ إيقاف {count} تسجيلات وإنهاء ملفات MP4..."
+    )
+
+
+async def list_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not authorized(update):
+        await deny(update)
+        return
+
+    if not recordings:
+        await update.message.reply_text(
+            "📭 لا توجد تسجيلات نشطة."
+        )
+        return
+
+    lines = ["🔴 التسجيلات النشطة:\n"]
+
+    for number, recording in recordings.items():
+        lines.append(
+            f"#{number} — /stop {number}\n"
+            f"{recording.page_url}"
+        )
+
+    await update.message.reply_text("\n\n".join(lines))
+
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not authorized(update):
+        await deny(update)
+        return
+
+    await update.message.reply_text(
+        "🎥 HLS Recorder جاهز.\n\n"
+        "بدء تسجيل:\n"
+        "/record رابط_صفحة_البث\n\n"
+        "عرض التسجيلات:\n"
+        "/list\n\n"
+        "إيقاف تسجيل:\n"
+        "/stop رقم\n\n"
+        "إيقاف الجميع:\n"
+        "/stopall"
+    )
+
+
 def main():
-    if not GITHUB_TOKEN:raise RuntimeError("PAT_TOKEN أو GITHUB_TOKEN مطلوب لتشغيل البوت.")
-    app=Application.builder().token(BOT_TOKEN).build()
-    cmds={"start":start_cmd,"Addwatch":add_cmd,"addwatch":add_cmd,"Removewatch":remove_cmd,"removewatch":remove_cmd,"Watchlist":watch_cmd,"watchlist":watch_cmd,"record":record_cmd,"Record":record_cmd,"stop":stop_cmd,"Stop":stop_cmd,"stopall":stopall_cmd,"Stopall":stopall_cmd,"list":list_cmd,"List":list_cmd}
-    for name,fn in cmds.items():app.add_handler(CommandHandler(name,fn))
-    print("HLS Telegram Recorder Bot started.");app.run_polling(allowed_updates=Update.ALL_TYPES)
-if __name__=="__main__":main()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start_command)
+    )
+
+    application.add_handler(
+        CommandHandler("record", record_command)
+    )
+
+    application.add_handler(
+        CommandHandler("stop", stop_command)
+    )
+
+    application.add_handler(
+        CommandHandler("stopall", stop_all_command)
+    )
+
+    application.add_handler(
+        CommandHandler("list", list_command)
+    )
+
+    print("HLS Telegram Recorder started.")
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+if __name__ == "__main__":
+    main()
