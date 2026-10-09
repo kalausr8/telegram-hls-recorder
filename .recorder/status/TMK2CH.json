@@ -2,8 +2,8 @@
   "record_id": "TMK2CH",
   "url": "https://www.tango.me/watina",
   "username": "watina",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 65,
+  "size_mb": 13.79,
   "hls_status": "recording"
 }
