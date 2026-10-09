@@ -2,8 +2,8 @@
   "record_id": "O6LXD2",
   "url": "https://www.tango.me/halla3",
   "username": "halla3",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 66,
+  "size_mb": 18.79,
   "hls_status": "recording"
 }
