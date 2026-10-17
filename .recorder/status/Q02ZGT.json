@@ -2,8 +2,8 @@
   "record_id": "Q02ZGT",
   "url": "https://www.tango.me/dlw-t-15",
   "username": "dlw-t-15",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 90,
+  "segments_count": 20,
+  "size_mb": 5.64,
   "hls_status": "recording"
 }
