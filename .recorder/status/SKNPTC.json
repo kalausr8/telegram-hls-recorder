@@ -2,8 +2,8 @@
   "record_id": "SKNPTC",
   "url": "https://www.tango.me/wes-326",
   "username": "wes-326",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 14,
+  "size_mb": 3.69,
   "hls_status": "recording"
 }
