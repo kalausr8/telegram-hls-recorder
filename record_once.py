@@ -11,7 +11,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
-
 import aiohttp
 from playwright.async_api import async_playwright
 
@@ -26,6 +25,7 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "telegram-hls-recorder")
 RECORD_ID = os.environ.get("RECORD_ID", "UNKNOWN")
 TARGET_USERNAME = os.environ.get("TARGET_USERNAME", "").strip()
 PAGE_URL = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+PROCESS_INSTANCE_ID = f"{os.getpid()}-{int(time.time() * 1000000)}"
 
 TELEGRAM_MAX_MB = 49
 PART_TARGET_MB = 47
@@ -38,6 +38,7 @@ SEGMENT_TIMEOUT = 30
 # ✅ تحسين #1: تقليل ضغط GitHub API (من 2 إلى 30 ثانية)
 STOP_CHECK_INTERVAL = 30.0  # فحص إشارة الإيقاف كل 30 ثانية
 PLAYLIST_POLL_INTERVAL = 3.0  # فحص قائمة التشغيل كل 3 ثوانٍ
+
 MAX_PLAYLIST_RETRIES = 5
 MAX_SEGMENT_RETRIES = 3
 STATUS_UPDATE_INTERVAL = 60
@@ -45,8 +46,8 @@ STATUS_UPDATE_INTERVAL = 60
 # ✅ تحسين #3: إعادة فتح الـ session كل 45 دقيقة
 SESSION_REFRESH_INTERVAL = 45 * 60  # 45 دقيقة
 
-STOP_FILE = f".recorder/stop/{RECORD_ID}"
-WORK_DIR = Path("recording_work")
+_WORK_DIR_NAME = re.sub(r"[^A-Za-z0-9._-]+", "_", str(RECORD_ID or "unknown")).strip("_") or "unknown"
+WORK_DIR = Path("recording_work") / _WORK_DIR_NAME
 SEGMENTS_DIR = WORK_DIR / "segments"
 OUTPUT_DIR = WORK_DIR / "output"
 PARTS_DIR = OUTPUT_DIR / "parts"
@@ -57,9 +58,16 @@ stop_requested = False
 # Active recording guard configuration
 # ============================================================
 try:
-    MAX_ACTIVE_RECORDINGS = int(os.environ.get("MAX_ACTIVE_RECORDINGS", "5"))
+    _max_active_env = int(os.environ.get("MAX_ACTIVE_RECORDINGS", "10"))
 except Exception:
-    MAX_ACTIVE_RECORDINGS = 5
+    _max_active_env = 10
+
+if _max_active_env < 1:
+    MAX_ACTIVE_RECORDINGS = 1
+elif _max_active_env > 10:
+    MAX_ACTIVE_RECORDINGS = 10
+else:
+    MAX_ACTIVE_RECORDINGS = _max_active_env
 
 try:
     ACTIVE_STALE_SECONDS = int(os.environ.get("ACTIVE_STALE_SECONDS", "10800"))
@@ -333,6 +341,7 @@ async def build_browser_session(page, context):
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": PAGE_URL,
     }
+
     if origin:
         headers["Origin"] = origin
     if cookie_header:
@@ -347,7 +356,7 @@ async def build_browser_session(page, context):
 async def inspect_page_for_hls(page, discovered):
     try:
         html = await page.content()
-        found = re.findall(r'https?://[^"\'\s]+?\.m3u8[^"\'\s]*', html, flags=re.IGNORECASE)
+        found = re.findall(r"https?://[^\"'\s]+?\.m3u8[^\"'\s]*", html, flags=re.IGNORECASE)
         for url in found:
             url = url.replace("&amp;", "&")
             if url not in discovered:
@@ -447,6 +456,7 @@ async def find_live_playlist(context, discovered):
     for url in candidates:
         if await check_stop():
             return None, None
+
         if url in checked:
             continue
         checked.add(url)
@@ -462,6 +472,7 @@ async def find_live_playlist(context, discovered):
 
         if parsed["type"] == "master":
             variants = parsed["variants"]
+
             # ✅ Sort by bandwidth descending (highest quality first)
             variants.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
 
@@ -529,10 +540,12 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
     global stop_requested
 
     log("[RECORDER] Starting HLS recording...")
+
     SEGMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
     downloaded = set()
     segment_files = []
+
     initial_segments = initial_playlist.get("segments", [])
     log(f"[RECORDER] Initial segments: {len(initial_segments)}")
 
@@ -594,6 +607,7 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
             # ✅ تحسين #3: إعادة فتح الـ session كل 45 دقيقة
             if time.time() - last_session_refresh > SESSION_REFRESH_INTERVAL:
                 log(f"[SESSION] 🔄 Refreshing browser session ({SESSION_REFRESH_INTERVAL // 60}min passed)...")
+
                 try:
                     # إغلاق المتصفح القديم
                     try:
@@ -623,6 +637,7 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
                     except Exception as goto_exc:
                         log(f"[SESSION] ⚠️ Could not reload page: {goto_exc}")
                         # الاستمرار بالـ session الجديد حتى لو فشل إعادة التحميل
+
                 except Exception as exc:
                     log(f"[SESSION] ⚠️ Refresh failed: {exc}")
                     # الاستمرار بالـ session القديم كـ fallback
@@ -637,10 +652,12 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
             if not playlist_text:
                 consecutive_playlist_errors += 1
                 log(f"[RECORDER] Playlist request failed ({consecutive_playlist_errors}/{MAX_PLAYLIST_RETRIES})...")
+
                 if consecutive_playlist_errors >= MAX_PLAYLIST_RETRIES:
                     log("[RECORDER] Max playlist retries reached. Stopping.")
                     await send_message(f"⚠️ التسجيل #{RECORD_ID} توقف.\n\nالسبب:\nانتهت محاولات إعادة الاتصال بـ HLS.")
                     break
+
                 await asyncio.sleep(PLAYLIST_POLL_INTERVAL)
                 continue
 
@@ -650,8 +667,8 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
             if parsed["type"] == "master":
                 variants = parsed["variants"]
                 variants.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
-                switched = False
 
+                switched = False
                 for variant in variants:
                     if await check_stop():
                         break
@@ -676,6 +693,7 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
 
             segments = parsed.get("segments", [])
             new_segments = [url for url in segments if url not in downloaded]
+
             if new_segments:
                 log(f"[RECORDER] New segments: {len(new_segments)}")
 
@@ -745,8 +763,10 @@ def mux_segments(segment_files):
         return None
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     concat_file = create_concat_file(segment_files)
     output_file = OUTPUT_DIR / f"{BASE_NAME}.mp4"
+
     log(f"[MUX] Creating MP4: {output_file}")
 
     # ✅ تحسين #2: FFmpeg flags للبثوث الطويلة
@@ -762,6 +782,7 @@ def mux_segments(segment_files):
 
     try:
         result = subprocess.run(command, capture_output=True, text=True)
+
         if result.returncode != 0:
             log("[MUX] FFmpeg failed:")
             log(result.stderr[-5000:])
@@ -786,6 +807,7 @@ def mux_part(segment_files, part_number):
         return None
 
     PARTS_DIR.mkdir(parents=True, exist_ok=True)
+
     part_file = PARTS_DIR / f"{BASE_NAME}part{part_number:03d}.mp4"
     concat_name = f"part_{part_number:03d}.txt"
     concat_file = create_concat_file(segment_files, concat_name)
@@ -803,6 +825,7 @@ def mux_part(segment_files, part_number):
 
     try:
         result = subprocess.run(command, capture_output=True, text=True)
+
         if result.returncode != 0:
             log(f"[PART] FFmpeg failed for Part {part_number}:")
             log(result.stderr[-3000:])
@@ -839,6 +862,7 @@ def split_recording_into_parts(segment_files):
         return []
 
     valid_segments = [path for path in segment_files if path.exists() and path.is_file() and path.stat().st_size > 0]
+
     if not valid_segments:
         log("[PARTS] No valid segment files.")
         return []
@@ -855,6 +879,7 @@ def split_recording_into_parts(segment_files):
     log(f"[PARTS] Target per part: {PART_TARGET_MB} MB")
 
     PARTS_DIR.mkdir(parents=True, exist_ok=True)
+
     for old_file in PARTS_DIR.glob("*.mp4"):
         try:
             old_file.unlink()
@@ -862,16 +887,19 @@ def split_recording_into_parts(segment_files):
             log(f"[PARTS] Could not remove old part {old_file}: {exc}")
 
     ESTIMATE_TARGET_BYTES = int(PART_TARGET_BYTES * 0.90)
+
     groups = []
     current_group = []
     current_bytes = 0
 
     for segment in valid_segments:
         segment_size = segment.stat().st_size
+
         if current_group and current_bytes + segment_size > ESTIMATE_TARGET_BYTES:
             groups.append(current_group)
             current_group = []
             current_bytes = 0
+
         current_group.append(segment)
         current_bytes += segment_size
 
@@ -895,7 +923,7 @@ def split_recording_into_parts(segment_files):
             size_mb = size / 1024 / 1024
             log(f"[PARTS] Single-segment Part {part_number_hint}: {size_mb:.2f} MB")
 
-            if size < TELEGRAM_MAX_MB:
+            if size_mb < TELEGRAM_MAX_MB:
                 verified_groups.append((part_file, size))
                 return
 
@@ -923,6 +951,7 @@ def split_recording_into_parts(segment_files):
         right = group[middle:]
 
         log(f"[PARTS] Part {part_number_hint} is too large ({size_mb:.2f} MB). Splitting {len(group)} segments into {len(left)} + {len(right)}.")
+
         verify_group(left, part_number_hint)
         next_hint = len(verified_groups) + 1
         verify_group(right, next_hint)
@@ -980,6 +1009,7 @@ async def send_video_file(file_path, part_number=None, total_parts=None):
         return False
 
     size_mb = file_path.stat().st_size / 1024 / 1024
+
     log(f"[TELEGRAM] Video size: {size_mb:.2f} MB")
 
     if size_mb >= TELEGRAM_MAX_MB:
@@ -1034,6 +1064,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
         return False
 
     full_size_mb = output_file.stat().st_size / 1024 / 1024
+
     log(f"[TELEGRAM] Final MP4 size: {full_size_mb:.2f} MB")
 
     # ✅ جديد: تنسيق المدة بشكل أفضل
@@ -1072,6 +1103,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
     )
 
     parts = split_recording_into_parts(segment_files)
+
     if not parts:
         await send_message("❌ تعذر تقسيم التسجيل إلى أجزاء قابلة للإرسال.")
         return False
@@ -1115,8 +1147,10 @@ async def main():
     log("Starting persistent HLS recorder...")
     log(f"Opening stream page: {PAGE_URL}")
     log(f"[SESSION] Record ID: {RECORD_ID}")
+
     if TARGET_USERNAME:
         log(f"[SESSION] Target Username: {TARGET_USERNAME}")
+
     log(f"[STOP] Watching GitHub file: {STOP_FILE}")
 
     discovered = []
@@ -1153,13 +1187,17 @@ async def main():
             log(f"[PAGE] goto warning: {exc}")
 
         discovery_started = time.time()
+
         while time.time() - discovery_started < DISCOVERY_TIMEOUT:
             if await check_stop():
                 break
+
             await inspect_page_for_hls(page, discovered)
+
             if discovered:
                 if time.time() - discovery_started > 5:
                     break
+
             await asyncio.sleep(1)
 
         await inspect_page_for_hls(page, discovered)
@@ -1181,6 +1219,7 @@ async def main():
         log(f"[HLS] Total discovered URLs: {len(discovered)}")
 
         playlist_url, playlist = await find_live_playlist(context, discovered)
+
         if not playlist_url or not playlist:
             if await check_stop():
                 await browser.close()
@@ -1195,6 +1234,7 @@ async def main():
             return 1
 
         log(f"[HLS] Recording playlist: {playlist_url}")
+
         headers = await build_browser_session(page, context)
 
         # ✅ تغيير: تمرير playwright بدلاً من context فقط (للـ session refresh)
@@ -1211,15 +1251,18 @@ async def main():
 
     if not segment_files:
         log("[MUX] No recorded segments.")
+
         if stop_requested:
             await send_message(f"⏹️ تم إيقاف التسجيل #{RECORD_ID}، لكن لم يتم تسجيل أي مقطع.")
         else:
             await send_message("❌ لم يتم تسجيل أي جزء من البث.")
+
         await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
         await github_delete_file(f".recorder/status/{RECORD_ID}.json", f"Remove status {RECORD_ID}")
         return 0
 
     output_file = mux_segments(segment_files)
+
     if not output_file:
         await send_message("❌ فشل إنشاء ملف MP4 بعد انتهاء التسجيل.")
         await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
@@ -1278,14 +1321,12 @@ _BROADCAST_CONTACT_FRAME_COUNT = 12
 _BROADCAST_CONTACT_COLS = 4
 _BROADCAST_CONTACT_MAX_BYTES = int(9 * 1024 * 1024)
 _BROADCAST_FFMPEG_TIMEOUT = 900
-
 _BROADCAST_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
 ]
-
 
 def _broadcast_run_command(command, timeout=_BROADCAST_FFMPEG_TIMEOUT, log_error=True):
     try:
@@ -1302,7 +1343,6 @@ def _broadcast_run_command(command, timeout=_BROADCAST_FFMPEG_TIMEOUT, log_error
         log(f"[CONTACT] Command exception: {exc}")
         return None
 
-
 def _broadcast_find_font():
     for candidate in _BROADCAST_FONT_CANDIDATES:
         try:
@@ -1312,12 +1352,13 @@ def _broadcast_find_font():
             pass
     return None
 
-
 def _broadcast_drawtext_filter(text, font_path):
     safe_text = str(text).replace(":", r"\:")
     options = [f"text='{safe_text}'"]
+
     if font_path:
         options.append(f"fontfile={font_path}")
+
     options.extend([
         "fontcolor=white",
         "fontsize=28",
@@ -1326,8 +1367,8 @@ def _broadcast_drawtext_filter(text, font_path):
         "x=10",
         "y=10",
     ])
-    return "drawtext=" + ":".join(options)
 
+    return "drawtext=" + ":".join(options)
 
 def _broadcast_format_timestamp(seconds):
     try:
@@ -1341,8 +1382,8 @@ def _broadcast_format_timestamp(seconds):
 
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
 
+    return f"{minutes:02d}:{secs:02d}"
 
 def _broadcast_duration_text(seconds):
     try:
@@ -1356,10 +1397,11 @@ def _broadcast_duration_text(seconds):
 
     if hours > 0:
         return f"{hours}h {minutes}m"
+
     if minutes > 0:
         return f"{minutes}m"
-    return f"{secs}s"
 
+    return f"{secs}s"
 
 def _broadcast_get_duration_seconds(file_path, fallback_duration=0.0):
     probe_cmd = [
@@ -1368,6 +1410,7 @@ def _broadcast_get_duration_seconds(file_path, fallback_duration=0.0):
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(file_path),
     ]
+
     result = _broadcast_run_command(probe_cmd, timeout=60, log_error=False)
     if result is not None and result.returncode == 0:
         try:
@@ -1378,6 +1421,7 @@ def _broadcast_get_duration_seconds(file_path, fallback_duration=0.0):
             pass
 
     result = _broadcast_run_command(["ffmpeg", "-hide_banner", "-i", str(file_path)], timeout=30, log_error=False)
+
     if result is not None:
         match = re.search(r"Duration:\s*(\d+):(\d+):(\d+)\.(\d+)", result.stderr or "")
         if match:
@@ -1401,7 +1445,6 @@ def _broadcast_get_duration_seconds(file_path, fallback_duration=0.0):
 
     return 0.0
 
-
 def _broadcast_extract_frame(video_path, target_seconds, duration_seconds, frame_path, label, font_path, use_label):
     try:
         if frame_path.exists():
@@ -1423,6 +1466,7 @@ def _broadcast_extract_frame(video_path, target_seconds, duration_seconds, frame
     label_filter = _broadcast_drawtext_filter(label, font_path) if (use_label and label) else ""
 
     attempts = []
+
     if label_filter:
         attempts.append((f"thumbnail=120,{label_filter}", start, actual_window))
         attempts.append((label_filter, exact_target, 0.0))
@@ -1438,8 +1482,10 @@ def _broadcast_extract_frame(video_path, target_seconds, duration_seconds, frame
             pass
 
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+
         if seek_pos > 0:
             cmd += ["-ss", f"{seek_pos:.3f}"]
+
         if window_size > 0:
             cmd += ["-t", f"{window_size:.3f}"]
 
@@ -1451,15 +1497,16 @@ def _broadcast_extract_frame(video_path, target_seconds, duration_seconds, frame
         cmd += ["-frames:v", "1", "-q:v", "1", str(frame_path)]
 
         result = _broadcast_run_command(cmd, timeout=180, log_error=False)
+
         if result is not None and result.returncode == 0 and frame_path.exists() and frame_path.stat().st_size > 0:
             return True
 
     return False
 
-
 def _broadcast_compress_image(image_path, max_bytes):
     if not image_path or not image_path.exists():
         return False
+
     if image_path.stat().st_size <= max_bytes:
         return True
 
@@ -1472,7 +1519,9 @@ def _broadcast_compress_image(image_path, max_bytes):
             "-q:v", str(quality),
             str(tmp_path),
         ]
+
         result = _broadcast_run_command(cmd, timeout=180, log_error=False)
+
         if result is not None and result.returncode == 0 and tmp_path.exists():
             if tmp_path.stat().st_size <= max_bytes:
                 try:
@@ -1480,6 +1529,7 @@ def _broadcast_compress_image(image_path, max_bytes):
                     return True
                 except Exception as exc:
                     log(f"[CONTACT] Could not replace compressed image: {exc}")
+
             try:
                 tmp_path.unlink(missing_ok=True)
             except Exception:
@@ -1493,7 +1543,9 @@ def _broadcast_compress_image(image_path, max_bytes):
             "-q:v", "3",
             str(tmp_path),
         ]
+
         result = _broadcast_run_command(cmd, timeout=180, log_error=False)
+
         if result is not None and result.returncode == 0 and tmp_path.exists():
             if tmp_path.stat().st_size <= max_bytes:
                 try:
@@ -1501,13 +1553,13 @@ def _broadcast_compress_image(image_path, max_bytes):
                     return True
                 except Exception as exc:
                     log(f"[CONTACT] Could not replace scaled image: {exc}")
+
             try:
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
 
     return image_path.exists() and image_path.stat().st_size <= max_bytes
-
 
 def _broadcast_generate_contact_sheet(video_path, fallback_duration=0.0):
     work_dir = None
@@ -1530,6 +1582,7 @@ def _broadcast_generate_contact_sheet(video_path, fallback_duration=0.0):
                 pass
 
         duration = _broadcast_get_duration_seconds(video_path, fallback_duration)
+
         count = _BROADCAST_CONTACT_FRAME_COUNT
 
         if duration > 0:
@@ -1611,6 +1664,7 @@ def _broadcast_generate_contact_sheet(video_path, fallback_duration=0.0):
                 "-q:v", "1",
                 str(contact_path),
             ]
+
             result = _broadcast_run_command(tile_cmd, timeout=300, log_error=True)
 
             if result is None or result.returncode != 0 or not contact_path.exists() or contact_path.stat().st_size == 0:
@@ -1638,10 +1692,10 @@ def _broadcast_generate_contact_sheet(video_path, fallback_duration=0.0):
         log(f"[CONTACT] Contact sheet generation failed: {exc}")
         return None, work_dir, fallback_duration, 0
 
-
 async def _broadcast_send_photo(file_path, caption):
     if not BOT_TOKEN or not ADMIN_USER_ID:
         return False
+
     if not file_path or not Path(file_path).exists():
         return False
 
@@ -1658,13 +1712,16 @@ async def _broadcast_send_photo(file_path, caption):
 
                 with file_path.open("rb") as photo_file:
                     form.add_field("photo", photo_file, filename=file_path.name, content_type="image/jpeg")
-                    async with session.post(photo_url, data=form) as response:
-                        text = await response.text()
-                        log(f"[CONTACT] sendPhoto: HTTP {response.status}")
-                        if response.status != 200:
-                            log(f"[CONTACT] Response: {text[:3000]}")
-                        if response.status == 200:
-                            return True
+
+                async with session.post(photo_url, data=form) as response:
+                    text = await response.text()
+                    log(f"[CONTACT] sendPhoto: HTTP {response.status}")
+
+                    if response.status != 200:
+                        log(f"[CONTACT] Response: {text[:3000]}")
+
+                    if response.status == 200:
+                        return True
         except Exception as exc:
             log(f"[CONTACT] Photo upload failed: {exc}")
 
@@ -1679,21 +1736,22 @@ async def _broadcast_send_photo(file_path, caption):
 
             with file_path.open("rb") as document_file:
                 form.add_field("document", document_file, filename=file_path.name, content_type="image/jpeg")
-                async with session.post(document_url, data=form) as response:
-                    text = await response.text()
-                    log(f"[CONTACT] sendDocument fallback: HTTP {response.status}")
-                    if response.status != 200:
-                        log(f"[CONTACT] Response: {text[:3000]}")
-                    if response.status == 200:
-                        return True
+
+            async with session.post(document_url, data=form) as response:
+                text = await response.text()
+                log(f"[CONTACT] sendDocument fallback: HTTP {response.status}")
+
+                if response.status != 200:
+                    log(f"[CONTACT] Response: {text[:3000]}")
+
+                if response.status == 200:
+                    return True
     except Exception as exc:
         log(f"[CONTACT] Document fallback failed: {exc}")
 
     return False
 
-
 _BROADCAST_ORIGINAL_SEND_RECORDING = send_recording
-
 
 async def _broadcast_send_recording(output_file, segment_files, duration_seconds):
     uploaded = await _BROADCAST_ORIGINAL_SEND_RECORDING(output_file, segment_files, duration_seconds)
@@ -1724,6 +1782,7 @@ async def _broadcast_send_recording(output_file, segment_files, duration_seconds
                     )
 
                 sent = await _broadcast_send_photo(contact_path, caption)
+
                 if sent:
                     log(f"[CONTACT] Full broadcast contact sheet sent for #{RECORD_ID}.")
                 else:
@@ -1743,9 +1802,7 @@ async def _broadcast_send_recording(output_file, segment_files, duration_seconds
 
     return uploaded
 
-
 send_recording = _broadcast_send_recording
-
 # ============================================================
 # Active recording guard helpers
 # ============================================================
@@ -1756,17 +1813,14 @@ def _guard_normalize_identity(value):
     value = re.sub(r"\s+", "", value)
     return value
 
-
 def _guard_identity_key():
     identity = _guard_normalize_identity(TARGET_USERNAME)
     if not identity:
         identity = _guard_normalize_identity(RECORD_ID)
     return safe_filename(identity or "unknown")
 
-
 def _guard_user_lock_path(identity):
     return f"{USER_LOCK_DIR}/{identity}.json"
-
 
 def _guard_parse_iso_datetime(value):
     if not value:
@@ -1779,14 +1833,12 @@ def _guard_parse_iso_datetime(value):
     except Exception:
         return None
 
-
 def _guard_age_seconds(value):
     dt = _guard_parse_iso_datetime(value)
     if not dt:
         return None
     age = (datetime.now(timezone.utc) - dt).total_seconds()
     return max(0.0, age)
-
 
 async def _guard_github_api_request(method, path, body=None, timeout=20):
     if not GITHUB_TOKEN:
@@ -1806,16 +1858,17 @@ async def _guard_github_api_request(method, path, body=None, timeout=20):
             async with session.request(method, url, headers=headers, json=body) as response:
                 text = await response.text()
                 data = None
+
                 if text:
                     try:
                         data = json.loads(text)
                     except Exception:
                         data = text
+
                 return response.status, data
     except Exception as exc:
         log(f"[GUARD] GitHub API {method} {path} failed: {exc}")
         return None, None
-
 
 async def _guard_get_file(path):
     status, data = await _guard_github_api_request("GET", path)
@@ -1836,17 +1889,17 @@ async def _guard_get_file(path):
 
     return status, None, None
 
-
 async def _guard_list_dir(path):
     status, data = await _guard_github_api_request("GET", path)
+
     if status == 200 and isinstance(data, list):
         names = []
         for item in data:
             if isinstance(item, dict) and item.get("name"):
                 names.append(str(item.get("name")))
         return names
-    return []
 
+    return []
 
 async def _guard_put_json(path, obj, message, sha=None):
     try:
@@ -1860,6 +1913,7 @@ async def _guard_put_json(path, obj, message, sha=None):
         body["sha"] = sha
 
     status, data = await _guard_github_api_request("PUT", path, body)
+
     if status in (200, 201):
         new_sha = None
         if isinstance(data, dict):
@@ -1871,7 +1925,6 @@ async def _guard_put_json(path, obj, message, sha=None):
     log(f"[GUARD] PUT failed for {path}: HTTP {status}")
     return False, None
 
-
 async def _guard_delete_file(path, message, sha=None):
     if not sha:
         status, _, sha = await _guard_get_file(path)
@@ -1881,7 +1934,6 @@ async def _guard_delete_file(path, message, sha=None):
     body = {"message": message, "sha": sha}
     status, _ = await _guard_github_api_request("DELETE", path, body)
     return status in (200, 204)
-
 
 async def _guard_acquire_admission_lock(timeout_seconds=120):
     if not GITHUB_TOKEN:
@@ -1896,8 +1948,10 @@ async def _guard_acquire_admission_lock(timeout_seconds=120):
 
         status, obj, sha = await _guard_get_file(ADMISSION_LOCK_FILE)
         now_iso = datetime.now(timezone.utc).isoformat()
+
         payload = {
             "owner": RECORD_ID,
+            "process_instance_id": PROCESS_INSTANCE_ID,
             "acquired_at": now_iso,
             "pid": os.getpid(),
         }
@@ -1910,11 +1964,13 @@ async def _guard_acquire_admission_lock(timeout_seconds=120):
             )
             if ok:
                 return True
+
         elif status == 200:
             owner = obj.get("owner") if isinstance(obj, dict) else None
+            instance = str(obj.get("process_instance_id", "")) if isinstance(obj, dict) else ""
             age = _guard_age_seconds(obj.get("acquired_at")) if isinstance(obj, dict) else None
 
-            if owner == RECORD_ID:
+            if owner == RECORD_ID and instance == PROCESS_INSTANCE_ID:
                 return True
 
             if obj is None or age is None or age > ADMISSION_LOCK_TTL_SECONDS:
@@ -1932,17 +1988,19 @@ async def _guard_acquire_admission_lock(timeout_seconds=120):
 
     return False
 
-
 async def _guard_release_admission_lock():
     if not GITHUB_TOKEN:
         return
 
     try:
         status, obj, sha = await _guard_get_file(ADMISSION_LOCK_FILE)
+
         if status == 200 and sha:
             owner = obj.get("owner") if isinstance(obj, dict) else None
+            instance = str(obj.get("process_instance_id", "")) if isinstance(obj, dict) else ""
             age = _guard_age_seconds(obj.get("acquired_at")) if isinstance(obj, dict) else None
-            if owner == RECORD_ID or obj is None or age is None or age > ADMISSION_LOCK_TTL_SECONDS:
+
+            if (owner == RECORD_ID and instance == PROCESS_INSTANCE_ID) or obj is None or age is None or age > ADMISSION_LOCK_TTL_SECONDS:
                 await _guard_delete_file(
                     ADMISSION_LOCK_FILE,
                     f"Release admission lock {RECORD_ID}",
@@ -1951,13 +2009,13 @@ async def _guard_release_admission_lock():
     except Exception as exc:
         log(f"[GUARD] Could not release admission lock: {exc}")
 
-
 async def _guard_is_record_active(record_id, active_obj):
     if not record_id:
         return False
 
     try:
         status_status, status_obj, _ = await _guard_get_file(f"{STATUS_DIR}/{record_id}.json")
+
         if isinstance(status_obj, dict):
             age = _guard_age_seconds(status_obj.get("updated_at") or status_obj.get("timestamp"))
             if age is not None and age < ACTIVE_STALE_SECONDS:
@@ -1980,7 +2038,6 @@ async def _guard_is_record_active(record_id, active_obj):
 
     return False
 
-
 async def _guard_cleanup_stale_states():
     if not GITHUB_TOKEN:
         return
@@ -1994,11 +2051,13 @@ async def _guard_cleanup_stale_states():
                 continue
 
             record_id = name[:-5]
+
             if record_id == RECORD_ID:
                 continue
 
             active_path = f"{ACTIVE_DIR}/{name}"
             status, active_obj, _ = await _guard_get_file(active_path)
+
             if status != 200:
                 continue
 
@@ -2014,29 +2073,33 @@ async def _guard_cleanup_stale_states():
             log(f"[GUARD] Removed stale active records: {', '.join(removed_active)}")
 
         lock_names = await _guard_list_dir(USER_LOCK_DIR)
+
         for name in lock_names:
             if not name.endswith(".json"):
                 continue
 
             lock_path = f"{USER_LOCK_DIR}/{name}"
             status, lock_obj, sha = await _guard_get_file(lock_path)
+
             if status != 200 or not isinstance(lock_obj, dict):
                 continue
 
             record_id = str(lock_obj.get("record_id", ""))
             age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
+
             if age is None or age <= USER_LOCK_TTL_SECONDS:
                 continue
 
             active_status, active_obj, _ = await _guard_get_file(f"{ACTIVE_DIR}/{record_id}.json") if record_id else (404, None, None)
+
             if active_status == 200 and await _guard_is_record_active(record_id, active_obj):
                 continue
 
             log(f"[GUARD] Removing stale user lock: {name} ({record_id})")
             await _guard_delete_file(lock_path, f"Remove stale user lock {name}", sha=sha)
+
     except Exception as exc:
         log(f"[GUARD] Stale cleanup failed: {exc}")
-
 
 async def _guard_find_duplicate_identity(identity):
     if not identity:
@@ -2048,22 +2111,41 @@ async def _guard_find_duplicate_identity(identity):
 
         if status == 200 and isinstance(lock_obj, dict):
             record_id = str(lock_obj.get("record_id", ""))
-            if record_id and record_id != RECORD_ID:
+            lock_instance = str(lock_obj.get("process_instance_id", ""))
+
+            if record_id:
                 age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
-                if age is None or age < USER_LOCK_TTL_SECONDS:
-                    return record_id
+                fresh = age is None or age < USER_LOCK_TTL_SECONDS
+
+                if fresh:
+                    if record_id != RECORD_ID:
+                        return record_id
+
+                    if lock_instance != PROCESS_INSTANCE_ID:
+                        return record_id
 
         active_names = await _guard_list_dir(ACTIVE_DIR)
+
         for name in active_names:
             if not name.endswith(".json"):
                 continue
 
             record_id = name[:-5]
-            if record_id == RECORD_ID:
-                continue
 
             status, active_obj, _ = await _guard_get_file(f"{ACTIVE_DIR}/{name}")
+
             if status != 200 or not isinstance(active_obj, dict):
+                continue
+
+            active_instance = str(active_obj.get("process_instance_id", ""))
+
+            if record_id == RECORD_ID:
+                if active_instance == PROCESS_INSTANCE_ID:
+                    continue
+
+                if await _guard_is_record_active(record_id, active_obj):
+                    return record_id
+
                 continue
 
             other_identity = _guard_normalize_identity(active_obj.get("username") or active_obj.get("identity"))
@@ -2072,53 +2154,66 @@ async def _guard_find_duplicate_identity(identity):
 
             if await _guard_is_record_active(record_id, active_obj):
                 return record_id
+
     except Exception as exc:
         log(f"[GUARD] Duplicate identity check failed: {exc}")
 
     return None
-
 
 async def _guard_count_active_records():
     active_ids = set()
 
     try:
         active_names = await _guard_list_dir(ACTIVE_DIR)
+
         for name in active_names:
             if not name.endswith(".json"):
                 continue
 
             record_id = name[:-5]
-            if record_id == RECORD_ID:
-                continue
 
             status, active_obj, _ = await _guard_get_file(f"{ACTIVE_DIR}/{name}")
+
             if status != 200:
                 continue
+
+            if record_id == RECORD_ID:
+                active_instance = str(active_obj.get("process_instance_id", "")) if isinstance(active_obj, dict) else ""
+                if active_instance == PROCESS_INSTANCE_ID:
+                    continue
 
             if await _guard_is_record_active(record_id, active_obj):
                 active_ids.add(record_id)
 
         lock_names = await _guard_list_dir(USER_LOCK_DIR)
+
         for name in lock_names:
             if not name.endswith(".json"):
                 continue
 
             status, lock_obj, _ = await _guard_get_file(f"{USER_LOCK_DIR}/{name}")
+
             if status != 200 or not isinstance(lock_obj, dict):
                 continue
 
             record_id = str(lock_obj.get("record_id", ""))
-            if not record_id or record_id == RECORD_ID:
+            if not record_id:
                 continue
 
+            if record_id == RECORD_ID:
+                lock_instance = str(lock_obj.get("process_instance_id", ""))
+                if lock_instance == PROCESS_INSTANCE_ID:
+                    continue
+
             age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
+
             if age is None or age < USER_LOCK_TTL_SECONDS:
                 active_ids.add(record_id)
+
     except Exception as exc:
         log(f"[GUARD] Active count failed: {exc}")
 
     return len(active_ids)
-
 
 async def _guard_acquire_user_lock(identity):
     lock_path = _guard_user_lock_path(identity)
@@ -2132,6 +2227,7 @@ async def _guard_acquire_user_lock(identity):
         "started_at": now_iso,
         "updated_at": now_iso,
         "pid": os.getpid(),
+        "process_instance_id": PROCESS_INSTANCE_ID,
         "max_active_recordings": MAX_ACTIVE_RECORDINGS,
     }
 
@@ -2139,10 +2235,17 @@ async def _guard_acquire_user_lock(identity):
 
     if status == 200 and existing_sha:
         existing_record_id = str(existing_obj.get("record_id", "")) if isinstance(existing_obj, dict) else ""
+        existing_instance = str(existing_obj.get("process_instance_id", "")) if isinstance(existing_obj, dict) else ""
         age = _guard_age_seconds(existing_obj.get("updated_at") or existing_obj.get("started_at")) if isinstance(existing_obj, dict) else None
 
-        if existing_record_id and existing_record_id != RECORD_ID and (age is None or age < USER_LOCK_TTL_SECONDS):
-            return False, existing_record_id, existing_sha
+        if existing_record_id:
+            if existing_record_id != RECORD_ID:
+                if age is None or age < USER_LOCK_TTL_SECONDS:
+                    return False, existing_record_id, existing_sha
+            else:
+                if existing_instance != PROCESS_INSTANCE_ID:
+                    if age is None or age < USER_LOCK_TTL_SECONDS:
+                        return False, "duplicate_same_record_id", existing_sha
 
         if isinstance(existing_obj, dict):
             payload["started_at"] = existing_obj.get("started_at") or now_iso
@@ -2153,9 +2256,11 @@ async def _guard_acquire_user_lock(identity):
             f"Acquire user lock {identity} for {RECORD_ID}",
             sha=existing_sha,
         )
+
         if ok:
             return True, None, new_sha
-        return False, "update_failed", new_sha
+
+        return False, "update_failed", None
 
     if status == 404:
         ok, new_sha = await _guard_put_json(
@@ -2163,12 +2268,13 @@ async def _guard_acquire_user_lock(identity):
             payload,
             f"Acquire user lock {identity} for {RECORD_ID}",
         )
+
         if ok:
             return True, None, new_sha
+
         return False, "create_failed_or_conflict", None
 
     return False, f"github_status_{status}", None
-
 
 async def _guard_touch_user_lock():
     if not GITHUB_TOKEN:
@@ -2181,9 +2287,22 @@ async def _guard_touch_user_lock():
     status, obj, sha = await _guard_get_file(lock_path)
 
     if status == 200 and sha and isinstance(obj, dict) and str(obj.get("record_id", "")) == RECORD_ID:
+        lock_instance = str(obj.get("process_instance_id", ""))
+
+        if lock_instance and lock_instance != PROCESS_INSTANCE_ID:
+            return
+
+        if not lock_instance:
+            lock_pid = str(obj.get("pid", ""))
+            if lock_pid and lock_pid != str(os.getpid()):
+                return
+
         obj["updated_at"] = now_iso
         obj["identity"] = identity
         obj["username"] = TARGET_USERNAME
+        obj["process_instance_id"] = PROCESS_INSTANCE_ID
+        obj["pid"] = os.getpid()
+
         await _guard_put_json(
             lock_path,
             obj,
@@ -2201,14 +2320,15 @@ async def _guard_touch_user_lock():
             "started_at": now_iso,
             "updated_at": now_iso,
             "pid": os.getpid(),
+            "process_instance_id": PROCESS_INSTANCE_ID,
             "max_active_recordings": MAX_ACTIVE_RECORDINGS,
         }
+
         await _guard_put_json(
             lock_path,
             payload,
             f"Restore user lock {identity} for {RECORD_ID}",
         )
-
 
 async def _guard_release_user_lock():
     if not GITHUB_TOKEN:
@@ -2218,11 +2338,17 @@ async def _guard_release_user_lock():
     lock_path = _guard_user_lock_path(identity)
 
     status, obj, sha = await _guard_get_file(lock_path)
+
     if status == 200 and sha and isinstance(obj, dict):
         record_id = str(obj.get("record_id", ""))
-        if record_id == RECORD_ID:
-            await _guard_delete_file(lock_path, f"Release user lock {identity} {RECORD_ID}", sha=sha)
 
+        if record_id == RECORD_ID:
+            lock_instance = str(obj.get("process_instance_id", ""))
+
+            if lock_instance == PROCESS_INSTANCE_ID:
+                await _guard_delete_file(lock_path, f"Release user lock {identity} {RECORD_ID}", sha=sha)
+            elif not lock_instance and str(obj.get("pid", "")) == str(os.getpid()):
+                await _guard_delete_file(lock_path, f"Release user lock {identity} {RECORD_ID}", sha=sha)
 
 async def _guard_reserve_active_file(identity):
     active_path = f"{ACTIVE_DIR}/{RECORD_ID}.json"
@@ -2237,10 +2363,26 @@ async def _guard_reserve_active_file(identity):
         "updated_at": now_iso,
         "hls_status": "reserved",
         "source": "record_once_guard",
+        "pid": os.getpid(),
+        "process_instance_id": PROCESS_INSTANCE_ID,
     }
 
     status, existing_obj, existing_sha = await _guard_get_file(active_path)
+
     if status == 200 and isinstance(existing_obj, dict):
+        existing_record_id = str(existing_obj.get("record_id", ""))
+        existing_instance = str(existing_obj.get("process_instance_id", ""))
+        age = _guard_age_seconds(existing_obj.get("updated_at") or existing_obj.get("started_at"))
+
+        if existing_record_id:
+            if existing_record_id != RECORD_ID:
+                if age is None or age < ACTIVE_STALE_SECONDS:
+                    return False
+            else:
+                if existing_instance != PROCESS_INSTANCE_ID:
+                    if age is None or age < ACTIVE_STALE_SECONDS:
+                        return False
+
         payload["started_at"] = existing_obj.get("started_at") or now_iso
 
     ok, _ = await _guard_put_json(
@@ -2249,8 +2391,8 @@ async def _guard_reserve_active_file(identity):
         f"Reserve active slot {RECORD_ID}",
         sha=existing_sha if status == 200 else None,
     )
-    return ok
 
+    return ok
 
 async def _acquire_broadcast_slot():
     if not GITHUB_TOKEN:
@@ -2294,12 +2436,13 @@ async def _acquire_broadcast_slot():
 
             log(f"[GUARD] Slot acquired: {active_count + 1}/{MAX_ACTIVE_RECORDINGS} active, identity='{identity}', record=#{RECORD_ID}.")
             return True
+
         finally:
             await _guard_release_admission_lock()
+
     except Exception as exc:
         log(f"[GUARD] Slot acquisition failed: {exc}")
         return False
-
 
 async def _release_broadcast_slot():
     try:
@@ -2317,17 +2460,23 @@ async def _release_broadcast_slot():
     except Exception as exc:
         log(f"[GUARD] Could not remove guarded status file: {exc}")
 
-
 _ORIGINAL_GITHUB_UPDATE_FILE = github_update_file
-
 
 async def _guarded_github_update_file(path, content_dict, message):
     is_status_update = (path == f"{STATUS_DIR}/{RECORD_ID}.json")
+    is_active_update = (path == f"{ACTIVE_DIR}/{RECORD_ID}.json")
 
-    if is_status_update and isinstance(content_dict, dict):
+    if (is_status_update or is_active_update) and isinstance(content_dict, dict):
         content_dict = dict(content_dict)
         content_dict["record_id"] = RECORD_ID
         content_dict["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        if is_active_update:
+            content_dict.setdefault("identity", _guard_identity_key())
+            content_dict.setdefault("username", TARGET_USERNAME)
+            content_dict.setdefault("url", PAGE_URL)
+            content_dict["process_instance_id"] = PROCESS_INSTANCE_ID
+            content_dict.setdefault("pid", os.getpid())
 
     result = await _ORIGINAL_GITHUB_UPDATE_FILE(path, content_dict, message)
 
@@ -2339,14 +2488,13 @@ async def _guarded_github_update_file(path, content_dict, message):
 
     return result
 
-
 github_update_file = _guarded_github_update_file
 
 _ORIGINAL_MAIN_FUNCTION = main
 
-
 async def _guarded_main():
     allowed = await _acquire_broadcast_slot()
+
     if not allowed:
         log("[GUARD] Recording was not started because the active-recording guard rejected it.")
         return 0
@@ -2355,7 +2503,6 @@ async def _guarded_main():
         return await _ORIGINAL_MAIN_FUNCTION()
     finally:
         await _release_broadcast_slot()
-
 
 main = _guarded_main
 
@@ -2370,7 +2517,7 @@ if __name__ == "__main__":
         log("[STOP] Keyboard interrupt.")
         sys.exit(0)
     except Exception as exc:
-        log(f"[FATAL] {type(exc).name}: {exc}")
+        log(f"[FATAL] {type(exc).__name__}: {exc}")
         try:
             asyncio.run(send_message("❌ حدث خطأ غير متوقع أثناء التسجيل."))
         except Exception:
