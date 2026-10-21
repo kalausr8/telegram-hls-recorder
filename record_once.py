@@ -18,16 +18,13 @@ from playwright.async_api import async_playwright
 # ============================================================
 # Configuration
 # ============================================================
-
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "kalausr8")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "telegram-hls-recorder")
 RECORD_ID = os.environ.get("RECORD_ID", "UNKNOWN")
 TARGET_USERNAME = os.environ.get("TARGET_USERNAME", "").strip()
-
 PAGE_URL = sys.argv[1].strip() if len(sys.argv) > 1 else ""
 
 TELEGRAM_MAX_MB = 49
@@ -41,7 +38,6 @@ SEGMENT_TIMEOUT = 30
 # ✅ تحسين #1: تقليل ضغط GitHub API (من 2 إلى 30 ثانية)
 STOP_CHECK_INTERVAL = 30.0  # فحص إشارة الإيقاف كل 30 ثانية
 PLAYLIST_POLL_INTERVAL = 3.0  # فحص قائمة التشغيل كل 3 ثوانٍ
-
 MAX_PLAYLIST_RETRIES = 5
 MAX_SEGMENT_RETRIES = 3
 STATUS_UPDATE_INTERVAL = 60
@@ -50,7 +46,6 @@ STATUS_UPDATE_INTERVAL = 60
 SESSION_REFRESH_INTERVAL = 45 * 60  # 45 دقيقة
 
 STOP_FILE = f".recorder/stop/{RECORD_ID}"
-
 WORK_DIR = Path("recording_work")
 SEGMENTS_DIR = WORK_DIR / "segments"
 OUTPUT_DIR = WORK_DIR / "output"
@@ -61,14 +56,12 @@ stop_requested = False
 # ============================================================
 # Logging
 # ============================================================
-
 def log(message):
     print(message, flush=True)
 
 # ============================================================
 # Signal handling
 # ============================================================
-
 def request_stop(signum, frame):
     global stop_requested
     if not stop_requested:
@@ -81,7 +74,6 @@ signal.signal(signal.SIGINT, request_stop)
 # ============================================================
 # Telegram
 # ============================================================
-
 async def telegram_request(method, data=None, file_data=None, file_name=None):
     if not BOT_TOKEN:
         log("[TELEGRAM] BOT_TOKEN is missing.")
@@ -115,11 +107,9 @@ async def telegram_request(method, data=None, file_data=None, file_name=None):
                 if response.status != 200:
                     log(f"[TELEGRAM] Response: {text[:3000]}")
                 return response.status, text
-
     except Exception as exc:
         log(f"[TELEGRAM] Error: {exc}")
-
-    return None
+        return None
 
 async def send_message(text):
     if not ADMIN_USER_ID:
@@ -129,10 +119,10 @@ async def send_message(text):
 # ============================================================
 # GitHub State Management
 # ============================================================
-
 async def github_update_file(path, content_dict, message):
     if not GITHUB_TOKEN:
         return
+
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -141,6 +131,7 @@ async def github_update_file(path, content_dict, message):
         "User-Agent": "telegram-hls-recorder",
     }
     timeout = aiohttp.ClientTimeout(total=15)
+
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             sha = None
@@ -148,12 +139,12 @@ async def github_update_file(path, content_dict, message):
                 if resp.status == 200:
                     data = await resp.json()
                     sha = data.get("sha")
-            
+
             encoded = base64.b64encode(json.dumps(content_dict, indent=2).encode("utf-8")).decode("utf-8")
             body = {"message": message, "content": encoded}
             if sha:
                 body["sha"] = sha
-                
+
             async with session.put(url, headers=headers, json=body) as resp:
                 if resp.status not in (200, 201):
                     text = await resp.text()
@@ -166,6 +157,7 @@ async def github_update_file(path, content_dict, message):
 async def github_delete_file(path, message):
     if not GITHUB_TOKEN:
         return
+
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -174,6 +166,7 @@ async def github_delete_file(path, message):
         "User-Agent": "telegram-hls-recorder",
     }
     timeout = aiohttp.ClientTimeout(total=15)
+
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             sha = None
@@ -181,10 +174,10 @@ async def github_delete_file(path, message):
                 if resp.status == 200:
                     data = await resp.json()
                     sha = data.get("sha")
-            
+
             if not sha:
                 return
-                
+
             body = {"message": message, "sha": sha}
             async with session.delete(url, headers=headers, json=body) as resp:
                 if resp.status not in (200, 204):
@@ -197,7 +190,6 @@ async def github_delete_file(path, message):
 # ============================================================
 # GitHub stop signal
 # ============================================================
-
 async def github_stop_requested():
     if not GITHUB_TOKEN or not RECORD_ID:
         return False
@@ -217,7 +209,6 @@ async def github_stop_requested():
                 if response.status == 404:
                     return False
                 if response.status != 200:
-                    # لا نحتاج لتسجيل هذا بعد الآن (تقليل الـ noise)
                     return False
 
                 data = await response.json()
@@ -246,7 +237,6 @@ async def github_stop_requested():
                 lower = raw_stripped.lower()
                 record_matches = str(RECORD_ID).lower() in lower
                 stop_matches = "stop" in lower or "true" in lower or lower == "1"
-
                 if record_matches and stop_matches:
                     log("[STOP] Valid text stop signal detected.")
                     return True
@@ -254,7 +244,6 @@ async def github_stop_requested():
                 if raw_stripped:
                     log(f"[STOP] Stop file exists for {RECORD_ID}; treating it as a stop signal.")
                     return True
-
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -275,35 +264,36 @@ async def check_stop():
 # ============================================================
 # Helpers
 # ============================================================
-
 def normalize_url(url):
-    if not url: return None
+    if not url:
+        return None
     return url.strip()
 
 def is_m3u8(url):
-    if not url: return False
+    if not url:
+        return False
     return ".m3u8" in url.lower()
 
 def safe_filename(value):
-    if not value: return "unknown"
+    if not value:
+        return "unknown"
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
     return value[:180]
 
 def origin_from_url(url):
     parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc: return ""
+    if not parsed.scheme or not parsed.netloc:
+        return ""
     return f"{parsed.scheme}://{parsed.netloc}"
 
 # ============================================================
 # BASE_NAME defined AFTER safe_filename
 # ============================================================
-
 BASE_NAME = safe_filename(TARGET_USERNAME) if TARGET_USERNAME else safe_filename(RECORD_ID)
 
 # ============================================================
 # Browser session headers
 # ============================================================
-
 async def build_browser_session(page, context):
     user_agent = await page.evaluate("() => navigator.userAgent")
     cookies = await context.cookies()
@@ -316,8 +306,10 @@ async def build_browser_session(page, context):
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": PAGE_URL,
     }
-    if origin: headers["Origin"] = origin
-    if cookie_header: headers["Cookie"] = cookie_header
+    if origin:
+        headers["Origin"] = origin
+    if cookie_header:
+        headers["Cookie"] = cookie_header
 
     log(f"[SESSION] Browser cookies: {len(cookies)}")
     return headers
@@ -325,11 +317,10 @@ async def build_browser_session(page, context):
 # ============================================================
 # HLS discovery
 # ============================================================
-
 async def inspect_page_for_hls(page, discovered):
     try:
         html = await page.content()
-        found = re.findall(r'https?://[^"\']+?\.m3u8[^"\']*', html, flags=re.IGNORECASE)
+        found = re.findall(r"https?://[^\"'\s]+?\.m3u8[^\"'\s]*", html, flags=re.IGNORECASE)
         for url in found:
             url = url.replace("&amp;", "&")
             if url not in discovered:
@@ -352,10 +343,10 @@ async def inspect_page_for_hls(page, discovered):
 # ============================================================
 # Playlist parsing
 # ============================================================
-
 def parse_playlist(text, playlist_url):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines: return {"type": "empty", "variants": [], "segments": []}
+    if not lines:
+        return {"type": "empty", "variants": [], "segments": []}
 
     variants = []
     segments = []
@@ -366,10 +357,14 @@ def parse_playlist(text, playlist_url):
             is_master = True
             bandwidth = 0
             resolution = ""
+
             match = re.search(r"BANDWIDTH=(\d+)", line, flags=re.IGNORECASE)
-            if match: bandwidth = int(match.group(1))
+            if match:
+                bandwidth = int(match.group(1))
+
             match = re.search(r"RESOLUTION=([0-9]+x[0-9]+)", line, flags=re.IGNORECASE)
-            if match: resolution = match.group(1)
+            if match:
+                resolution = match.group(1)
 
             if index + 1 < len(lines):
                 next_line = lines[index + 1]
@@ -383,24 +378,31 @@ def parse_playlist(text, playlist_url):
                 if not segment_url.startswith("#"):
                     segments.append(urljoin(playlist_url, segment_url))
 
-    if is_master: return {"type": "master", "variants": variants, "segments": []}
+    if is_master:
+        return {"type": "master", "variants": variants, "segments": []}
+
     return {"type": "media", "variants": [], "segments": segments}
 
 # ============================================================
 # Browser HLS request
 # ============================================================
-
 async def browser_get_playlist(context, url):
     log(f"[PLAYLIST] Browser GET: {url}")
     try:
         request = await context.request.get(
             url,
-            headers={"Accept": "application/vnd.apple.mpegurl,application/x-mpegURL,*/*", "Referer": PAGE_URL},
+            headers={
+                "Accept": "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+                "Referer": PAGE_URL,
+            },
             timeout=PLAYLIST_TIMEOUT * 1000,
         )
         status = request.status
         log(f"[PLAYLIST] HTTP {status}: {url}")
-        if status < 200 or status >= 300: return None, status
+
+        if status < 200 or status >= 300:
+            return None, status
+
         text = await request.text()
         log(f"[PLAYLIST] Received {len(text)} bytes")
         return text, status
@@ -411,18 +413,20 @@ async def browser_get_playlist(context, url):
 # ============================================================
 # Find live media playlist (with quality logging)
 # ============================================================
-
 async def find_live_playlist(context, discovered):
     checked = set()
     candidates = list(discovered)
 
     for url in candidates:
-        if await check_stop(): return None, None
-        if url in checked: continue
+        if await check_stop():
+            return None, None
+        if url in checked:
+            continue
         checked.add(url)
 
         text, status = await browser_get_playlist(context, url)
-        if not text: continue
+        if not text:
+            continue
 
         parsed = parse_playlist(text, url)
         if parsed["type"] == "media" and parsed["segments"]:
@@ -431,28 +435,30 @@ async def find_live_playlist(context, discovered):
 
         if parsed["type"] == "master":
             variants = parsed["variants"]
-            # ✅ Sort by bandwidth descending (highest quality first)
             variants.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
-            
-            # ✅ NEW: Log all available qualities
+
             log(f"[HLS] Master playlist contains {len(variants)} variants:")
             for i, v in enumerate(variants, 1):
                 resolution = v.get("resolution", "unknown")
                 bandwidth = v.get("bandwidth", 0)
                 log(f"  [{i}] Resolution: {resolution} | Bandwidth: {bandwidth} bps")
-            
+
             if variants:
                 log(f"[HLS] 🎯 Selected highest quality: {variants[0].get('resolution', 'unknown')}")
 
             for variant in variants:
-                if await check_stop(): return None, None
-                variant_url = variant["url"]
-                if variant_url in checked: continue
-                checked.add(variant_url)
-                log(f"[HLS] Trying variant: {variant_url}")
+                if await check_stop():
+                    return None, None
 
+                variant_url = variant["url"]
+                if variant_url in checked:
+                    continue
+                checked.add(variant_url)
+
+                log(f"[HLS] Trying variant: {variant_url}")
                 variant_text, _ = await browser_get_playlist(context, variant_url)
-                if not variant_text: continue
+                if not variant_text:
+                    continue
 
                 variant_parsed = parse_playlist(variant_text, variant_url)
                 if variant_parsed["type"] == "media" and variant_parsed["segments"]:
@@ -464,7 +470,6 @@ async def find_live_playlist(context, discovered):
 # ============================================================
 # Segment downloader
 # ============================================================
-
 async def download_segment(session, url, path, headers):
     try:
         timeout = aiohttp.ClientTimeout(total=SEGMENT_TIMEOUT)
@@ -472,8 +477,11 @@ async def download_segment(session, url, path, headers):
             if response.status != 200:
                 log(f"[SEGMENT] HTTP {response.status}: {url}")
                 return False, response.status
+
             data = await response.read()
-            if not data: return False, response.status
+            if not data:
+                return False, response.status
+
             path.write_bytes(data)
             return True, 200
     except asyncio.CancelledError:
@@ -485,12 +493,12 @@ async def download_segment(session, url, path, headers):
 # ============================================================
 # Recording loop (مع تحسين Session Refresh)
 # ============================================================
-
 async def record_hls(playwright, context, page, playlist_url, initial_playlist, headers):
     """
     ✅ تحسين #3: Session Refresh كل 45 دقيقة لمنع Memory Leak
     """
     global stop_requested
+
     log("[RECORDER] Starting HLS recording...")
     SEGMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -501,11 +509,11 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
 
     timeout = aiohttp.ClientTimeout(total=SEGMENT_TIMEOUT)
     connector = aiohttp.TCPConnector(limit=10, ssl=False)
-    
+
     consecutive_playlist_errors = 0
     consecutive_segment_errors = 0
     last_status_update = 0
-    last_session_refresh = time.time()  # ✅ جديد: تتبع وقت آخر refresh
+    last_session_refresh = time.time()
     recording_start_time = time.time()
     start_time_iso = datetime.now(timezone.utc).isoformat()
 
@@ -515,68 +523,72 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
         f"Start recording {RECORD_ID}"
     )
 
-    # ✅ جديد: متغير للتحكم في فحص الإيقاف كل 30 ثانية
     stop_check_counter = 0
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while not stop_requested:
             stop_check_counter += 1
-            
+
             # ✅ تحسين #1: فحص الإيقاف كل 10 loops × 3s = 30 ثانية
             if stop_check_counter % 10 == 0:
-                if await check_stop(): 
+                if await check_stop():
                     break
-            
+
             if time.time() - last_status_update > STATUS_UPDATE_INTERVAL:
                 last_status_update = time.time()
                 duration = int(time.time() - recording_start_time)
                 size_bytes = sum(p.stat().st_size for p in segment_files if p.exists())
                 size_mb = size_bytes / 1024 / 1024
+
                 await github_update_file(
                     f".recorder/status/{RECORD_ID}.json",
-                    {"record_id": RECORD_ID, "url": PAGE_URL, "username": TARGET_USERNAME, "duration_seconds": duration, "segments_count": len(segment_files), "size_mb": round(size_mb, 2), "hls_status": "recording"},
+                    {
+                        "record_id": RECORD_ID,
+                        "url": PAGE_URL,
+                        "username": TARGET_USERNAME,
+                        "duration_seconds": duration,
+                        "segments_count": len(segment_files),
+                        "size_mb": round(size_mb, 2),
+                        "hls_status": "recording",
+                    },
                     f"Update status {RECORD_ID}"
                 )
+
                 try:
                     video_missing = await page.evaluate("() => !document.querySelector('video')")
-                    if video_missing: log("[RECORDER] Video element missing from page. Possible end/premium.")
-                except Exception: pass
+                    if video_missing:
+                        log("[RECORDER] Video element missing from page. Possible end/premium.")
+                except Exception:
+                    pass
 
             # ✅ تحسين #3: إعادة فتح الـ session كل 45 دقيقة
             if time.time() - last_session_refresh > SESSION_REFRESH_INTERVAL:
                 log(f"[SESSION] 🔄 Refreshing browser session ({SESSION_REFRESH_INTERVAL // 60}min passed)...")
                 try:
-                    # إغلاق المتصفح القديم
                     try:
                         await context.close()
                     except Exception:
                         pass
-                    
-                    # فتح context جديد
+
                     context = await playwright.chromium.new_context(
                         viewport={"width": 1280, "height": 720},
                         user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
                     )
                     page = await context.new_page()
-                    
-                    # إعادة ربط الـ response handler
+
                     async def handle_response(response):
-                        # لا نحتاج لعمل شيء هنا، فقط للحفاظ على الاتصال
                         pass
+
                     page.on("response", handle_response)
-                    
-                    # إعادة فتح الصفحة
+
                     try:
                         await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
                         last_session_refresh = time.time()
                         log("[SESSION] ✅ Session refreshed successfully")
                     except Exception as goto_exc:
                         log(f"[SESSION] ⚠️ Could not reload page: {goto_exc}")
-                        # الاستمرار بالـ session الجديد حتى لو فشل إعادة التحميل
-                        
                 except Exception as exc:
                     log(f"[SESSION] ⚠️ Refresh failed: {exc}")
-                    # الاستمرار بالـ session القديم كـ fallback
 
             try:
                 current_headers = await build_browser_session(page, context)
@@ -585,7 +597,6 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
                 log(f"[SESSION] Could not refresh headers: {exc}")
 
             playlist_text, status = await browser_get_playlist(context, playlist_url)
-
             if not playlist_text:
                 consecutive_playlist_errors += 1
                 log(f"[RECORDER] Playlist request failed ({consecutive_playlist_errors}/{MAX_PLAYLIST_RETRIES})...")
@@ -603,27 +614,37 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
                 variants = parsed["variants"]
                 variants.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
                 switched = False
+
                 for variant in variants:
-                    if await check_stop(): break
+                    if await check_stop():
+                        break
+
                     variant_text, _ = await browser_get_playlist(context, variant["url"])
-                    if not variant_text: continue
+                    if not variant_text:
+                        continue
+
                     variant_parsed = parse_playlist(variant_text, variant["url"])
                     if variant_parsed["type"] == "media" and variant_parsed["segments"]:
                         playlist_url = variant["url"]
                         parsed = variant_parsed
                         switched = True
                         break
-                if stop_requested: break
+
+                if stop_requested:
+                    break
+
                 if not switched:
                     await asyncio.sleep(PLAYLIST_POLL_INTERVAL)
                     continue
 
             segments = parsed.get("segments", [])
             new_segments = [url for url in segments if url not in downloaded]
-            if new_segments: log(f"[RECORDER] New segments: {len(new_segments)}")
+            if new_segments:
+                log(f"[RECORDER] New segments: {len(new_segments)}")
 
             for segment_url in new_segments:
-                if await check_stop(): break
+                if await check_stop():
+                    break
 
                 segment_number = len(segment_files)
                 filename = f"{segment_number:08d}.ts"
@@ -631,9 +652,11 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
 
                 ok = False
                 seg_status = None
+
                 for attempt in range(MAX_SEGMENT_RETRIES):
                     ok, seg_status = await download_segment(session, segment_url, path, headers)
-                    if ok: break
+                    if ok:
+                        break
                     await asyncio.sleep(2)
 
                 if ok:
@@ -644,17 +667,21 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
                 else:
                     consecutive_segment_errors += 1
                     log(f"[SEGMENT] Failed after retries: {segment_url} (HTTP {seg_status})")
+
                     if seg_status in (402, 403, 404, 410):
                         log("[RECORDER] Premium/Ended detected via HTTP status.")
                         await send_message(f"⚠️ التسجيل #{RECORD_ID} توقف.\n\nالسبب:\nتحول البث إلى خاص (Premium) أو انتهى.")
                         stop_requested = True
                         break
+
                     if consecutive_segment_errors >= 5:
                         log("[RECORDER] Too many consecutive segment errors. Stopping.")
                         await send_message(f"⚠️ التسجيل #{RECORD_ID} توقف.\n\nالسبب:\nفشل متكرر في تحميل المقاطع.")
                         break
 
-            if await check_stop(): break
+            if await check_stop():
+                break
+
             await asyncio.sleep(PLAYLIST_POLL_INTERVAL)
 
     log(f"[RECORDER] Recording stopped. Segments saved: {len(segment_files)}")
@@ -663,15 +690,16 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
 # ============================================================
 # MP4 muxing (مع تحسين FFmpeg للبث الطويل)
 # ============================================================
-
 def create_concat_file(segment_files, filename="segments.txt"):
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     concat_file = WORK_DIR / filename
+
     with concat_file.open("w", encoding="utf-8") as file:
         for path in segment_files:
             absolute_path = path.resolve()
             escaped = str(absolute_path).replace("'", "'\\''")
             file.write(f"file '{escaped}'\n")
+
     return concat_file
 
 def mux_segments(segment_files):
@@ -682,17 +710,16 @@ def mux_segments(segment_files):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     concat_file = create_concat_file(segment_files)
     output_file = OUTPUT_DIR / f"{BASE_NAME}.mp4"
-
     log(f"[MUX] Creating MP4: {output_file}")
-    
+
     # ✅ تحسين #2: FFmpeg flags للبثوث الطويلة
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-        "-fflags", "+discardcorrupt+genpts",  # ✅ جديد: إصلاح timestamps التالفة
+        "-fflags", "+discardcorrupt+genpts",
         "-f", "concat", "-safe", "0", "-i", str(concat_file),
         "-c", "copy",
         "-movflags", "+faststart",
-        "-avoid_negative_ts", "make_zero",  # ✅ جديد: منع timestamps سالبة
+        "-avoid_negative_ts", "make_zero",
         str(output_file),
     ]
 
@@ -702,6 +729,7 @@ def mux_segments(segment_files):
             log("[MUX] FFmpeg failed:")
             log(result.stderr[-5000:])
             return None
+
         if not output_file.exists():
             log("[MUX] Output file was not created.")
             return None
@@ -716,11 +744,12 @@ def mux_segments(segment_files):
 # ============================================================
 # Split large MP4 into valid MP4 video parts
 # ============================================================
-
 def mux_part(segment_files, part_number):
-    if not segment_files: return None
+    if not segment_files:
+        return None
+
     PARTS_DIR.mkdir(parents=True, exist_ok=True)
-    part_file = PARTS_DIR / f"{BASE_NAME}_part_{part_number:03d}.mp4"
+    part_file = PARTS_DIR / f"{BASE_NAME}part{part_number:03d}.mp4"
     concat_name = f"part_{part_number:03d}.txt"
     concat_file = create_concat_file(segment_files, concat_name)
 
@@ -740,8 +769,10 @@ def mux_part(segment_files, part_number):
         if result.returncode != 0:
             log(f"[PART] FFmpeg failed for Part {part_number}:")
             log(result.stderr[-3000:])
-            try: part_file.unlink(missing_ok=True)
-            except Exception: pass
+            try:
+                part_file.unlink(missing_ok=True)
+            except Exception:
+                pass
             return None
 
         if not part_file.exists():
@@ -751,18 +782,25 @@ def mux_part(segment_files, part_number):
         size = part_file.stat().st_size
         if size <= 0:
             log(f"[PART] Output file is empty: {part_file}")
-            try: part_file.unlink(missing_ok=True)
-            except Exception: pass
+            try:
+                part_file.unlink(missing_ok=True)
+            except Exception:
+                pass
             return None
+
         return part_file
     except Exception as exc:
         log(f"[PART] Exception while creating Part {part_number}: {exc}")
-        try: part_file.unlink(missing_ok=True)
-        except Exception: pass
+        try:
+            part_file.unlink(missing_ok=True)
+        except Exception:
+            pass
         return None
 
 def split_recording_into_parts(segment_files):
-    if not segment_files: return []
+    if not segment_files:
+        return []
+
     valid_segments = [path for path in segment_files if path.exists() and path.is_file() and path.stat().st_size > 0]
     if not valid_segments:
         log("[PARTS] No valid segment files.")
@@ -778,11 +816,13 @@ def split_recording_into_parts(segment_files):
 
     log("[PARTS] Large recording detected.")
     log(f"[PARTS] Target per part: {PART_TARGET_MB} MB")
-    PARTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    PARTS_DIR.mkdir(parents=True, exist_ok=True)
     for old_file in PARTS_DIR.glob("*.mp4"):
-        try: old_file.unlink()
-        except Exception as exc: log(f"[PARTS] Could not remove old part {old_file}: {exc}")
+        try:
+            old_file.unlink()
+        except Exception as exc:
+            log(f"[PARTS] Could not remove old part {old_file}: {exc}")
 
     ESTIMATE_TARGET_BYTES = int(PART_TARGET_BYTES * 0.90)
     groups = []
@@ -798,26 +838,36 @@ def split_recording_into_parts(segment_files):
         current_group.append(segment)
         current_bytes += segment_size
 
-    if current_group: groups.append(current_group)
+    if current_group:
+        groups.append(current_group)
+
     log(f"[PARTS] Initial estimated groups: {len(groups)}")
 
     verified_groups = []
 
     def verify_group(group, part_number_hint):
-        if not group: return
+        if not group:
+            return
+
         if len(group) == 1:
             part_file = mux_part(group, part_number_hint)
-            if part_file is None: raise RuntimeError("Failed to mux a single HLS segment.")
+            if part_file is None:
+                raise RuntimeError("Failed to mux a single HLS segment.")
+
             size = part_file.stat().st_size
             size_mb = size / 1024 / 1024
             log(f"[PARTS] Single-segment Part {part_number_hint}: {size_mb:.2f} MB")
+
             if size < TELEGRAM_MAX_MB:
                 verified_groups.append((part_file, size))
                 return
+
             raise RuntimeError(f"A single HLS segment produced a {size_mb:.2f} MB MP4, which is too large for Telegram.")
 
         part_file = mux_part(group, part_number_hint)
-        if part_file is None: raise RuntimeError(f"Failed to mux Part {part_number_hint}.")
+        if part_file is None:
+            raise RuntimeError(f"Failed to mux Part {part_number_hint}.")
+
         size = part_file.stat().st_size
         size_mb = size / 1024 / 1024
         log(f"[PARTS] Verified candidate Part {part_number_hint}: {size_mb:.2f} MB ({len(group)} segments)")
@@ -826,12 +876,15 @@ def split_recording_into_parts(segment_files):
             verified_groups.append((part_file, size))
             return
 
-        try: part_file.unlink(missing_ok=True)
-        except Exception: pass
+        try:
+            part_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
         middle = len(group) // 2
         left = group[:middle]
         right = group[middle:]
+
         log(f"[PARTS] Part {part_number_hint} is too large ({size_mb:.2f} MB). Splitting {len(group)} segments into {len(left)} + {len(right)}.")
         verify_group(left, part_number_hint)
         next_hint = len(verified_groups) + 1
@@ -839,30 +892,39 @@ def split_recording_into_parts(segment_files):
 
     try:
         for group in groups:
-            if stop_requested: log("[PARTS] Stop flag detected during part generation.")
+            if stop_requested:
+                log("[PARTS] Stop flag detected during part generation.")
             hint = len(verified_groups) + 1
             verify_group(group, hint)
     except Exception as exc:
         log(f"[PARTS] Fatal error while creating parts: {exc}")
         for part_file, _ in verified_groups:
-            try: part_file.unlink(missing_ok=True)
-            except Exception: pass
+            try:
+                part_file.unlink(missing_ok=True)
+            except Exception:
+                pass
         return []
 
     final_parts = []
+
     for index, (old_file, size) in enumerate(verified_groups, start=1):
         final_name = PARTS_DIR / f"{BASE_NAME}_part_{index:03d}.mp4"
+
         try:
             if old_file != final_name:
-                if final_name.exists(): final_name.unlink()
+                if final_name.exists():
+                    final_name.unlink()
                 old_file.rename(final_name)
+
             if not final_name.exists():
                 log(f"[PARTS] Final part does not exist after rename: {final_name}")
                 return []
+
             final_size = final_name.stat().st_size / 1024 / 1024
             if final_size >= TELEGRAM_MAX_MB:
                 log(f"[PARTS] SAFETY CHECK FAILED: {final_name.name} = {final_size:.2f} MB")
                 return []
+
             final_parts.append(final_name)
             log(f"[PARTS] Final Part {index}: {final_size:.2f} MB")
         except Exception as exc:
@@ -875,7 +937,6 @@ def split_recording_into_parts(segment_files):
 # ============================================================
 # Telegram upload
 # ============================================================
-
 async def send_video_file(file_path, part_number=None, total_parts=None):
     if not file_path or not file_path.exists():
         log(f"[TELEGRAM] Output file does not exist: {file_path}")
@@ -883,6 +944,7 @@ async def send_video_file(file_path, part_number=None, total_parts=None):
 
     size_mb = file_path.stat().st_size / 1024 / 1024
     log(f"[TELEGRAM] Video size: {size_mb:.2f} MB")
+
     if size_mb >= TELEGRAM_MAX_MB:
         log(f"[TELEGRAM] Refusing to upload a file too close to/over the Telegram limit: {size_mb:.2f} MB")
         return False
@@ -891,15 +953,18 @@ async def send_video_file(file_path, part_number=None, total_parts=None):
         caption = f"🎥 تسجيل {TARGET_USERNAME} (#{RECORD_ID})\n"
     else:
         caption = f"🎥 التسجيل #{RECORD_ID}\n"
-        
+
     if part_number is not None:
         caption += f"Part {part_number}"
-        if total_parts is not None: caption += f" / {total_parts}"
+        if total_parts is not None:
+            caption += f" / {total_parts}"
 
     MAX_UPLOAD_RETRIES = 3
+
     for attempt in range(MAX_UPLOAD_RETRIES):
         try:
             log(f"[TELEGRAM] Uploading video (attempt {attempt+1}): {file_path.name}")
+
             with file_path.open("rb") as file:
                 result = await telegram_request(
                     "sendVideo",
@@ -907,16 +972,20 @@ async def send_video_file(file_path, part_number=None, total_parts=None):
                     file_data=file,
                     file_name=file_path.name,
                 )
+
             if result and result[0] == 200:
                 log(f"[TELEGRAM] Video uploaded successfully: {file_path.name}")
                 return True
+
             log(f"[TELEGRAM] Video upload failed (attempt {attempt+1}): {file_path.name}")
         except Exception as exc:
             log(f"[TELEGRAM] Upload failed: {exc}")
+
         if attempt < MAX_UPLOAD_RETRIES - 1:
             wait_time = 5 * (attempt + 1)
             log(f"[TELEGRAM] Retrying in {wait_time} seconds...")
             await asyncio.sleep(wait_time)
+
     return False
 
 async def send_recording(output_file, segment_files, duration_seconds):
@@ -930,7 +999,6 @@ async def send_recording(output_file, segment_files, duration_seconds):
     full_size_mb = output_file.stat().st_size / 1024 / 1024
     log(f"[TELEGRAM] Final MP4 size: {full_size_mb:.2f} MB")
 
-    # ✅ جديد: تنسيق المدة بشكل أفضل
     duration_mins = duration_seconds // 60
     duration_hours = duration_mins // 60
     duration_mins_remaining = duration_mins % 60
@@ -941,7 +1009,6 @@ async def send_recording(output_file, segment_files, duration_seconds):
         duration_str = f"{duration_mins}m"
 
     if full_size_mb < TELEGRAM_MAX_MB:
-        # ✅ تحسين #4: رسالة مفصلة
         await send_message(
             f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
             f"👤 {TARGET_USERNAME}\n"
@@ -954,7 +1021,6 @@ async def send_recording(output_file, segment_files, duration_seconds):
         uploaded = await send_video_file(output_file)
         return uploaded
 
-    # ✅ تحسين #4: رسالة مفصلة للتسجيلات الكبيرة
     await send_message(
         f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
         f"👤 {TARGET_USERNAME}\n"
@@ -964,6 +1030,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
         f"🎯 الجودة: 720p (HD)\n"
         f"✂️ الملف كبير، سيتم تقسيمه إلى عدة فيديوهات وإرسالها بالترتيب..."
     )
+
     parts = split_recording_into_parts(segment_files)
     if not parts:
         await send_message("❌ تعذر تقسيم التسجيل إلى أجزاء قابلة للإرسال.")
@@ -971,6 +1038,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
 
     total_parts = len(parts)
     await send_message(f"📤 سيتم إرسال {total_parts} فيديوهات بالترتيب.")
+
     all_uploaded = True
 
     for index, part_file in enumerate(parts, start=1):
@@ -982,6 +1050,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
 
         size_mb = part_file.stat().st_size / 1024 / 1024
         log(f"[TELEGRAM] Sending Part {index}/{total_parts}: {size_mb:.2f} MB")
+
         uploaded = await send_video_file(part_file, part_number=index, total_parts=total_parts)
         if not uploaded:
             all_uploaded = False
@@ -992,12 +1061,12 @@ async def send_recording(output_file, segment_files, duration_seconds):
         await send_message(f"✅ تم إرسال التسجيل #{RECORD_ID} بالكامل في {total_parts} أجزاء.")
     else:
         await send_message(f"⚠️ انتهى إرسال التسجيل #{RECORD_ID}، لكن تعذر إرسال جزء أو أكثر.")
+
     return all_uploaded
 
 # ============================================================
 # Main
 # ============================================================
-
 async def main():
     if not PAGE_URL:
         print("Usage: python record_once.py \"https://example.com/stream/...\"")
@@ -1033,7 +1102,8 @@ async def main():
                     if url not in discovered:
                         discovered.append(url)
                         log(f"[HLS] Discovered from network response: {url}")
-            except Exception: pass
+            except Exception:
+                pass
 
         page.on("response", handle_response)
 
@@ -1044,10 +1114,12 @@ async def main():
 
         discovery_started = time.time()
         while time.time() - discovery_started < DISCOVERY_TIMEOUT:
-            if await check_stop(): break
+            if await check_stop():
+                break
             await inspect_page_for_hls(page, discovered)
             if discovered:
-                if time.time() - discovery_started > 5: break
+                if time.time() - discovery_started > 5:
+                    break
             await asyncio.sleep(1)
 
         await inspect_page_for_hls(page, discovered)
@@ -1067,14 +1139,15 @@ async def main():
             return 1
 
         log(f"[HLS] Total discovered URLs: {len(discovered)}")
-        playlist_url, playlist = await find_live_playlist(context, discovered)
 
+        playlist_url, playlist = await find_live_playlist(context, discovered)
         if not playlist_url or not playlist:
             if await check_stop():
                 await browser.close()
                 await send_message(f"⏹️ تم إيقاف التسجيل #{RECORD_ID}.")
                 await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
                 return 0
+
             log("[HLS] Discovered URLs were not usable media playlists.")
             await send_message("❌ تم اكتشاف HLS لكن تعذر الوصول إلى قائمة المقاطع الخاصة بالبث.")
             await browser.close()
@@ -1083,14 +1156,16 @@ async def main():
 
         log(f"[HLS] Recording playlist: {playlist_url}")
         headers = await build_browser_session(page, context)
-        
+
         # ✅ تغيير: تمرير playwright بدلاً من context فقط (للـ session refresh)
         segment_files, start_time_iso, recording_start_time = await record_hls(
             playwright, context, page, playlist_url, playlist, headers
         )
 
-        try: await browser.close()
-        except Exception: pass
+        try:
+            await browser.close()
+        except Exception:
+            pass
 
     log("Stopping recorder and preparing final MP4...")
 
@@ -1112,7 +1187,7 @@ async def main():
         return 1
 
     duration = int(time.time() - recording_start_time)
-    
+
     # ✅ تغيير: تمرير duration إلى send_recording
     uploaded = await send_recording(output_file, segment_files, duration)
 
@@ -1121,7 +1196,17 @@ async def main():
 
     await github_update_file(
         f".recorder/history/{RECORD_ID}.json",
-        {"record_id": RECORD_ID, "url": PAGE_URL, "username": TARGET_USERNAME, "started_at": start_time_iso, "ended_at": datetime.now(timezone.utc).isoformat(), "duration_seconds": duration, "size_mb": round(full_size_mb, 2), "parts_count": parts_count, "status": "success" if uploaded else "failed"},
+        {
+            "record_id": RECORD_ID,
+            "url": PAGE_URL,
+            "username": TARGET_USERNAME,
+            "started_at": start_time_iso,
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+            "duration_seconds": duration,
+            "size_mb": round(full_size_mb, 2),
+            "parts_count": parts_count,
+            "status": "success" if uploaded else "failed",
+        },
         f"History {RECORD_ID}"
     )
 
@@ -1135,7 +1220,7 @@ async def main():
                 log("[CLEANUP] Workspace cleaned.")
         except Exception as e:
             log(f"[CLEANUP] Error: {e}")
-            
+
         if stop_requested:
             await send_message(f"⏹️ تم إيقاف التسجيل #{RECORD_ID} وإرسال التسجيل بنجاح.")
         else:
@@ -1147,9 +1232,684 @@ async def main():
     return 0
 
 # ============================================================
-# Entrypoint
+# AUTO MEDIA ASSETS FEATURE v2 - START
+# ============================================================
+_ASSET_FEATURE_INSTALLED = True
+
+_ASSET_THUMBNAIL_MAX_BYTES = 190 * 1024
+_ASSET_BACKGROUND_MAX_BYTES = 2 * 1024 * 1024
+_ASSET_CONTACT_MAX_BYTES = 4 * 1024 * 1024
+_ASSET_CONTACT_MAX_FRAMES = 120
+_ASSET_CONTACT_GENERATION_TIMEOUT = 420
+_ASSET_FRAME_WIDTH = 208
+_ASSET_BACKGROUND_WIDTH = 1280
+_ASSET_BACKGROUND_HEIGHT = 720
+_ASSET_FFMPEG_TIMEOUT = 600
+
+_ASSET_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+]
+
+
+def _asset_run(command, timeout=_ASSET_FFMPEG_TIMEOUT, log_error=True):
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0 and log_error:
+            stderr_tail = (result.stderr or "")[-1200:]
+            log(f"[ASSETS] Command returned {result.returncode}: {stderr_tail}")
+        return result
+    except subprocess.TimeoutExpired:
+        cmd_hint = " ".join(str(item) for item in command[:6])
+        log(f"[ASSETS] Command timed out after {timeout}s: {cmd_hint}")
+        return None
+    except Exception as exc:
+        log(f"[ASSETS] Command exception: {exc}")
+        return None
+
+
+def _asset_find_font():
+    for candidate in _ASSET_FONT_CANDIDATES:
+        try:
+            if Path(candidate).exists():
+                return candidate
+        except Exception:
+            pass
+    return None
+
+
+def _asset_drawtext_filter(text, font_path):
+    options = [f"text='{text}'"]
+    if font_path:
+        options.append(f"fontfile={font_path}")
+    options.extend([
+        "fontcolor=white",
+        "fontsize=18",
+        "box=1",
+        "boxcolor=black@0.65",
+        "x=6",
+        "y=6",
+    ])
+    return "drawtext=" + ":".join(options)
+
+
+def _asset_make_asset_dir(file_path):
+    base = WORK_DIR / "assets"
+    base.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time() * 1000000)
+
+    while True:
+        name = safe_filename(f"{RECORD_ID}_{file_path.stem}_{os.getpid()}_{stamp}")
+        asset_dir = base / name
+        try:
+            asset_dir.mkdir(parents=False, exist_ok=False)
+            return asset_dir
+        except FileExistsError:
+            stamp += 1
+        except Exception:
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            return asset_dir
+
+
+def _asset_get_duration_seconds(file_path):
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(file_path),
+    ]
+    result = _asset_run(probe_cmd, timeout=60, log_error=False)
+    if result is not None and result.returncode == 0:
+        try:
+            return max(0.0, float(result.stdout.strip()))
+        except Exception:
+            pass
+
+    result = _asset_run(["ffmpeg", "-hide_banner", "-i", str(file_path)], timeout=30, log_error=False)
+    if result is not None:
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+)\.(\d+)", result.stderr or "")
+        if match:
+            try:
+                hours = int(match.group(1))
+                minutes = int(match.group(2))
+                seconds = int(match.group(3))
+                centis = int(match.group(4)[:2].ljust(2, "0"))
+                return float(hours * 3600 + minutes * 60 + seconds) + (centis / 100.0)
+            except Exception:
+                pass
+
+    return 0.0
+
+
+def _asset_downscale_image(image_path, max_bytes, initial_width):
+    if not image_path or not image_path.exists():
+        return False
+    if image_path.stat().st_size <= max_bytes:
+        return True
+
+    widths = [initial_width, 480, 320, 240]
+    qualities = [5, 6, 7, 8]
+
+    for width in widths:
+        for quality in qualities:
+            tmp_path = image_path.with_suffix(f".tmp_{width}_{quality}.jpg")
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(image_path),
+                "-vf", f"scale={width}:-2",
+                "-q:v", str(quality),
+                str(tmp_path),
+            ]
+            result = _asset_run(cmd, timeout=120, log_error=False)
+            if result is not None and result.returncode == 0 and tmp_path.exists():
+                if tmp_path.stat().st_size <= max_bytes:
+                    try:
+                        tmp_path.replace(image_path)
+                        return True
+                    except Exception as exc:
+                        log(f"[ASSETS] Could not replace downscaled image: {exc}")
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    return image_path.exists() and image_path.stat().st_size <= max_bytes
+
+
+def _asset_extract_thumbnail(file_path, asset_dir):
+    thumb_path = asset_dir / f"{safe_filename(file_path.stem)}_thumb.jpg"
+
+    commands = [
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(file_path),
+            "-map", "0:v:0",
+            "-vf", "thumbnail=100,scale=640:-2",
+            "-frames:v", "1",
+            "-q:v", "5",
+            str(thumb_path),
+        ],
+    ]
+
+    for seek_position in ("2", "10", "30", "60"):
+        commands.append(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", seek_position,
+                "-i", str(file_path),
+                "-map", "0:v:0",
+                "-vf", "scale=640:-2",
+                "-frames:v", "1",
+                "-q:v", "5",
+                str(thumb_path),
+            ]
+        )
+
+    commands.append(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(file_path),
+            "-map", "0:v:0",
+            "-vf", "scale=640:-2",
+            "-frames:v", "1",
+            "-q:v", "5",
+            str(thumb_path),
+        ]
+    )
+
+    for cmd in commands:
+        try:
+            if thumb_path.exists():
+                thumb_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        result = _asset_run(cmd, timeout=180, log_error=False)
+        if result is not None and result.returncode == 0 and thumb_path.exists() and thumb_path.stat().st_size > 0:
+            if _asset_downscale_image(thumb_path, _ASSET_THUMBNAIL_MAX_BYTES, 640):
+                return thumb_path
+            log("[ASSETS] Generated thumbnail remained too large after downscaling attempts.")
+
+    return None
+
+
+def _asset_generate_background(file_path, asset_dir):
+    bg_path = asset_dir / f"{safe_filename(file_path.stem)}_background.jpg"
+
+    vf_blur = (
+        "thumbnail=100,"
+        f"scale={_ASSET_BACKGROUND_WIDTH}:{_ASSET_BACKGROUND_HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={_ASSET_BACKGROUND_WIDTH}:{_ASSET_BACKGROUND_HEIGHT},"
+        "boxblur=20:2"
+    )
+    vf_plain = (
+        "thumbnail=100,"
+        f"scale={_ASSET_BACKGROUND_WIDTH}:{_ASSET_BACKGROUND_HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={_ASSET_BACKGROUND_WIDTH}:{_ASSET_BACKGROUND_HEIGHT}"
+    )
+
+    commands = [
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(file_path),
+            "-map", "0:v:0",
+            "-vf", vf_blur,
+            "-frames:v", "1",
+            "-q:v", "5",
+            str(bg_path),
+        ],
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(file_path),
+            "-map", "0:v:0",
+            "-vf", vf_plain,
+            "-frames:v", "1",
+            "-q:v", "5",
+            str(bg_path),
+        ],
+    ]
+
+    for seek_position in ("2", "10", "30"):
+        commands.append(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", seek_position,
+                "-i", str(file_path),
+                "-map", "0:v:0",
+                "-vf", vf_plain,
+                "-frames:v", "1",
+                "-q:v", "5",
+                str(bg_path),
+            ]
+        )
+
+    commands.append(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(file_path),
+            "-map", "0:v:0",
+            "-vf", vf_plain,
+            "-frames:v", "1",
+            "-q:v", "5",
+            str(bg_path),
+        ]
+    )
+
+    for cmd in commands:
+        try:
+            if bg_path.exists():
+                bg_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        result = _asset_run(cmd, timeout=180, log_error=False)
+        if result is not None and result.returncode == 0 and bg_path.exists() and bg_path.stat().st_size > 0:
+            if _asset_downscale_image(bg_path, _ASSET_BACKGROUND_MAX_BYTES, _ASSET_BACKGROUND_WIDTH):
+                return bg_path
+            log("[ASSETS] Generated background remained too large after downscaling attempts.")
+
+    return None
+
+
+def _asset_extract_frame(file_path, timestamp, frame_path, label=None, font_path=None, use_label=True):
+    try:
+        if frame_path.exists():
+            frame_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    vf = f"scale={_ASSET_FRAME_WIDTH}:-2"
+    if use_label and label is not None:
+        vf += "," + _asset_drawtext_filter(str(label), font_path)
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{max(0.0, float(timestamp)):.3f}",
+        "-i", str(file_path),
+        "-map", "0:v:0",
+        "-vf", vf,
+        "-frames:v", "1",
+        "-q:v", "5",
+        str(frame_path),
+    ]
+    result = _asset_run(cmd, timeout=60, log_error=False)
+    return result is not None and result.returncode == 0 and frame_path.exists() and frame_path.stat().st_size > 0
+
+
+def _asset_generate_contact_sheet(file_path, asset_dir):
+    duration = _asset_get_duration_seconds(file_path)
+    contact_path = asset_dir / f"{safe_filename(file_path.stem)}_contact.jpg"
+    frames_dir = asset_dir / f"{safe_filename(file_path.stem)}_frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    for old_file in frames_dir.glob("*.jpg"):
+        try:
+            old_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if duration <= 0:
+        total_minutes = 1
+    else:
+        total_minutes = int(duration // 60)
+        if duration % 60 > 0:
+            total_minutes += 1
+
+    if total_minutes < 1:
+        total_minutes = 1
+
+    step_minutes = 1
+    if total_minutes > _ASSET_CONTACT_MAX_FRAMES:
+        step_minutes = (total_minutes + _ASSET_CONTACT_MAX_FRAMES - 1) // _ASSET_CONTACT_MAX_FRAMES
+
+    selected_minutes = list(range(0, total_minutes, step_minutes))
+    if selected_minutes and selected_minutes[-1] != total_minutes - 1 and len(selected_minutes) < _ASSET_CONTACT_MAX_FRAMES:
+        selected_minutes.append(total_minutes - 1)
+
+    font_path = _asset_find_font()
+    label_available = True
+    frames = []
+    started = time.time()
+
+    for minute_index in selected_minutes:
+        if time.time() - started > _ASSET_CONTACT_GENERATION_TIMEOUT:
+            log("[ASSETS] Contact sheet generation stopped early due to time limit.")
+            break
+
+        frame_path = frames_dir / f"frame_{len(frames) + 1:04d}.jpg"
+        label_text = str(minute_index + 1)
+
+        if duration <= 0:
+            candidates = [0.0]
+        else:
+            base = minute_index * 60.0
+            minute_end = min(duration, base + 60.0)
+            remaining = max(0.1, minute_end - base)
+
+            raw_candidates = []
+            for offset in (2.0, 5.0, 10.0, 20.0, 30.0):
+                t = base + offset
+                if t < duration - 0.1:
+                    raw_candidates.append(t)
+
+            mid = base + min(30.0, remaining / 2.0)
+            if mid < duration - 0.1:
+                raw_candidates.append(mid)
+
+            raw_candidates.append(base + 0.1)
+            raw_candidates.append(max(0.0, duration - 0.2))
+
+            candidates = []
+            seen = set()
+            for t in raw_candidates:
+                if t < 0.0:
+                    t = 0.0
+                key = round(t, 2)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(t)
+
+        extracted = False
+
+        for t in candidates:
+            if label_available:
+                if _asset_extract_frame(file_path, t, frame_path, label_text, font_path, True):
+                    extracted = True
+                    break
+
+                if _asset_extract_frame(file_path, t, frame_path, label_text, font_path, False):
+                    label_available = False
+                    extracted = True
+                    break
+            else:
+                if _asset_extract_frame(file_path, t, frame_path, label_text, font_path, False):
+                    extracted = True
+                    break
+
+        if extracted:
+            frames.append(frame_path)
+        else:
+            log(f"[ASSETS] Could not extract a contact frame for minute {minute_index + 1}.")
+
+    if not frames:
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        return None
+
+    if len(frames) == 1:
+        try:
+            shutil.copyfile(frames[0], contact_path)
+        except Exception as exc:
+            log(f"[ASSETS] Could not copy single contact frame: {exc}")
+    else:
+        frame_count = len(frames)
+        cols = 1
+        while cols * cols < frame_count:
+            cols += 1
+        rows = (frame_count + cols - 1) // cols
+
+        tile_cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-start_number", "1",
+            "-i", str(frames_dir / "frame_%04d.jpg"),
+            "-vf", f"tile={cols}x{rows}",
+            "-frames:v", "1",
+            "-q:v", "5",
+            str(contact_path),
+        ]
+        result = _asset_run(tile_cmd, timeout=300, log_error=True)
+
+        if result is None or result.returncode != 0 or not contact_path.exists() or contact_path.stat().st_size == 0:
+            try:
+                shutil.copyfile(frames[0], contact_path)
+            except Exception as exc:
+                log(f"[ASSETS] Could not fallback contact frame: {exc}")
+
+    if contact_path.exists() and contact_path.stat().st_size > _ASSET_CONTACT_MAX_BYTES:
+        tmp_contact = contact_path.with_suffix(".tmp.jpg")
+        for scale_expression in ("iw/2:-2", "iw/3:-2"):
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(contact_path),
+                "-vf", f"scale={scale_expression}",
+                "-q:v", "6",
+                str(tmp_contact),
+            ]
+            result = _asset_run(cmd, timeout=180, log_error=False)
+            if result is not None and result.returncode == 0 and tmp_contact.exists():
+                if tmp_contact.stat().st_size <= _ASSET_CONTACT_MAX_BYTES:
+                    try:
+                        tmp_contact.replace(contact_path)
+                        break
+                    except Exception:
+                        pass
+            try:
+                tmp_contact.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    shutil.rmtree(frames_dir, ignore_errors=True)
+
+    if contact_path.exists() and contact_path.stat().st_size > 0:
+        return contact_path
+    return None
+
+
+async def _asset_send_photo(file_path, caption):
+    if not BOT_TOKEN or not ADMIN_USER_ID:
+        return False
+    if not file_path or not file_path.exists():
+        return False
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    timeout = aiohttp.ClientTimeout(total=180, connect=20, sock_read=150)
+
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                form = aiohttp.FormData()
+                form.add_field("chat_id", str(ADMIN_USER_ID))
+                form.add_field("caption", str(caption))
+
+                with file_path.open("rb") as photo_file:
+                    form.add_field("photo", photo_file, filename=file_path.name, content_type="image/jpeg")
+                    async with session.post(url, data=form) as response:
+                        text = await response.text()
+                        log(f"[ASSETS] sendPhoto: HTTP {response.status}")
+                        if response.status != 200:
+                            log(f"[ASSETS] Response: {text[:3000]}")
+                        if response.status == 200:
+                            return True
+        except Exception as exc:
+            log(f"[ASSETS] Photo upload failed: {exc}")
+
+        if attempt == 0:
+            await asyncio.sleep(3)
+
+    return False
+
+
+async def _asset_send_video_with_thumbnail(data, file_object, file_name, thumbnail_path):
+    if not BOT_TOKEN:
+        log("[TELEGRAM] BOT_TOKEN is missing.")
+        return None
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+    timeout = aiohttp.ClientTimeout(total=180, connect=20, sock_read=150)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            form = aiohttp.FormData()
+            for key, value in (data or {}).items():
+                form.add_field(key, str(value))
+
+            form.add_field("video", file_object, filename=file_name, content_type="video/mp4")
+
+            if thumbnail_path and thumbnail_path.exists():
+                with thumbnail_path.open("rb") as thumb_file:
+                    form.add_field("thumbnail", thumb_file, filename=thumbnail_path.name, content_type="image/jpeg")
+                    async with session.post(url, data=form) as response:
+                        text = await response.text()
+                        log(f"[ASSETS] sendVideo+thumbnail: HTTP {response.status}")
+                        if response.status != 200:
+                            log(f"[ASSETS] Response: {text[:3000]}")
+                        return response.status, text
+
+            async with session.post(url, data=form) as response:
+                text = await response.text()
+                log(f"[ASSETS] sendVideo: HTTP {response.status}")
+                if response.status != 200:
+                    log(f"[ASSETS] Response: {text[:3000]}")
+                return response.status, text
+    except Exception as exc:
+        log(f"[ASSETS] Video upload with thumbnail error: {exc}")
+
+    return None
+
+
+async def _asset_send_video_file(file_path, part_number=None, total_parts=None):
+    if not file_path or not file_path.exists():
+        log(f"[TELEGRAM] Output file does not exist: {file_path}")
+        return False
+
+    size_mb = file_path.stat().st_size / 1024 / 1024
+    log(f"[TELEGRAM] Video size: {size_mb:.2f} MB")
+
+    if size_mb >= TELEGRAM_MAX_MB:
+        log(f"[TELEGRAM] Refusing to upload a file too close to/over the Telegram limit: {size_mb:.2f} MB")
+        return False
+
+    if TARGET_USERNAME:
+        caption = f"🎥 تسجيل {TARGET_USERNAME} (#{RECORD_ID})\n"
+    else:
+        caption = f"🎥 التسجيل #{RECORD_ID}\n"
+
+    if part_number is not None:
+        caption += f"Part {part_number}"
+        if total_parts is not None:
+            caption += f" / {total_parts}"
+
+    asset_dir = None
+    thumbnail_path = None
+
+    try:
+        asset_dir = _asset_make_asset_dir(file_path)
+    except Exception as exc:
+        log(f"[ASSETS] Could not create asset directory: {exc}")
+
+    if asset_dir:
+        try:
+            thumbnail_path = _asset_extract_thumbnail(file_path, asset_dir)
+            if thumbnail_path:
+                log(f"[ASSETS] Thumbnail ready: {thumbnail_path.name} ({thumbnail_path.stat().st_size} bytes)")
+            else:
+                log("[ASSETS] Could not generate thumbnail; continuing without it.")
+        except Exception as exc:
+            log(f"[ASSETS] Thumbnail generation failed: {exc}")
+            thumbnail_path = None
+
+    upload_succeeded = False
+
+    try:
+        MAX_UPLOAD_RETRIES = 3
+
+        for attempt in range(MAX_UPLOAD_RETRIES):
+            try:
+                log(f"[TELEGRAM] Uploading video (attempt {attempt+1}): {file_path.name}")
+
+                with file_path.open("rb") as file:
+                    if thumbnail_path and thumbnail_path.exists() and thumbnail_path.stat().st_size <= _ASSET_THUMBNAIL_MAX_BYTES:
+                        result = await _asset_send_video_with_thumbnail(
+                            {"chat_id": ADMIN_USER_ID, "caption": caption, "supports_streaming": "true"},
+                            file,
+                            file_path.name,
+                            thumbnail_path,
+                        )
+                    else:
+                        result = await telegram_request(
+                            "sendVideo",
+                            data={"chat_id": ADMIN_USER_ID, "caption": caption, "supports_streaming": "true"},
+                            file_data=file,
+                            file_name=file_path.name,
+                        )
+
+                if result and result[0] == 200:
+                    log(f"[TELEGRAM] Video uploaded successfully: {file_path.name}")
+                    upload_succeeded = True
+                    break
+
+                log(f"[TELEGRAM] Video upload failed (attempt {attempt+1}): {file_path.name}")
+                if thumbnail_path:
+                    log("[ASSETS] Retrying without thumbnail because upload with thumbnail failed.")
+                    thumbnail_path = None
+
+            except Exception as exc:
+                log(f"[TELEGRAM] Upload failed: {exc}")
+                if thumbnail_path:
+                    thumbnail_path = None
+
+            if attempt < MAX_UPLOAD_RETRIES - 1:
+                wait_time = 5 * (attempt + 1)
+                log(f"[TELEGRAM] Retrying in {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+
+        if upload_succeeded:
+            if asset_dir:
+                background_path = None
+                try:
+                    background_path = _asset_generate_background(file_path, asset_dir)
+                    if background_path:
+                        log(f"[ASSETS] Background ready: {background_path.name} ({background_path.stat().st_size} bytes)")
+                    else:
+                        log("[ASSETS] Could not generate background.")
+                except Exception as exc:
+                    log(f"[ASSETS] Background generation failed: {exc}")
+
+                if background_path and background_path.exists():
+                    background_caption = caption + "\n🎨 خلفية خاصة بهذا المقطع"
+                    background_sent = await _asset_send_photo(background_path, background_caption)
+                    if not background_sent:
+                        log("[ASSETS] Background photo could not be sent; video delivery already succeeded.")
+
+                contact_path = None
+                try:
+                    contact_path = _asset_generate_contact_sheet(file_path, asset_dir)
+                    if contact_path:
+                        log(f"[ASSETS] Contact sheet ready: {contact_path.name} ({contact_path.stat().st_size} bytes)")
+                    else:
+                        log("[ASSETS] Could not generate contact sheet.")
+                except Exception as exc:
+                    log(f"[ASSETS] Contact sheet generation failed: {exc}")
+
+                if contact_path and contact_path.exists():
+                    contact_caption = caption + "\n🗓️ معاينة الدقائق الخاصة بهذا المقطع"
+                    contact_sent = await _asset_send_photo(contact_path, contact_caption)
+                    if not contact_sent:
+                        log("[ASSETS] Contact sheet photo could not be sent; video delivery already succeeded.")
+
+            return True
+
+        return False
+
+    finally:
+        if asset_dir:
+            try:
+                shutil.rmtree(asset_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+_ASSET_ORIGINAL_SEND_VIDEO_FILE = send_video_file
+send_video_file = _asset_send_video_file
+
+# ============================================================
+# AUTO MEDIA ASSETS FEATURE v2 - END
 # ============================================================
 
+# ============================================================
+# Entrypoint
+# ============================================================
 if __name__ == "__main__":
     try:
         exit_code = asyncio.run(main())
@@ -1158,8 +1918,9 @@ if __name__ == "__main__":
         log("[STOP] Keyboard interrupt.")
         sys.exit(0)
     except Exception as exc:
-        log(f"[FATAL] {type(exc).__name__}: {exc}")
+        log(f"[FATAL] {type(exc).name}: {exc}")
         try:
             asyncio.run(send_message("❌ حدث خطأ غير متوقع أثناء التسجيل."))
-        except Exception: pass
+        except Exception:
+            pass
         sys.exit(1)
