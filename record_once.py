@@ -54,6 +54,32 @@ PARTS_DIR = OUTPUT_DIR / "parts"
 stop_requested = False
 
 # ============================================================
+# Active recording guard configuration
+# ============================================================
+try:
+    MAX_ACTIVE_RECORDINGS = int(os.environ.get("MAX_ACTIVE_RECORDINGS", "5"))
+except Exception:
+    MAX_ACTIVE_RECORDINGS = 5
+
+try:
+    ACTIVE_STALE_SECONDS = int(os.environ.get("ACTIVE_STALE_SECONDS", "10800"))
+except Exception:
+    ACTIVE_STALE_SECONDS = 10800
+
+try:
+    ADMISSION_LOCK_TTL_SECONDS = int(os.environ.get("ADMISSION_LOCK_TTL_SECONDS", "120"))
+except Exception:
+    ADMISSION_LOCK_TTL_SECONDS = 120
+
+USER_LOCK_TTL_SECONDS = ACTIVE_STALE_SECONDS
+
+ACTIVE_DIR = ".recorder/active"
+STATUS_DIR = ".recorder/status"
+LOCK_DIR = ".recorder/locks"
+USER_LOCK_DIR = f"{LOCK_DIR}/users"
+ADMISSION_LOCK_FILE = f"{LOCK_DIR}/_admission.json"
+
+# ============================================================
 # Logging
 # ============================================================
 def log(message):
@@ -209,6 +235,7 @@ async def github_stop_requested():
                 if response.status == 404:
                     return False
                 if response.status != 200:
+                    # لا نحتاج لتسجيل هذا بعد الآن (تقليل الـ noise)
                     return False
 
                 data = await response.json()
@@ -320,7 +347,7 @@ async def build_browser_session(page, context):
 async def inspect_page_for_hls(page, discovered):
     try:
         html = await page.content()
-        found = re.findall(r"https?://[^\"'\s]+?\.m3u8[^\"'\s]*", html, flags=re.IGNORECASE)
+        found = re.findall(r'https?://[^"\'\s]+?\.m3u8[^"\'\s]*', html, flags=re.IGNORECASE)
         for url in found:
             url = url.replace("&amp;", "&")
             if url not in discovered:
@@ -435,8 +462,10 @@ async def find_live_playlist(context, discovered):
 
         if parsed["type"] == "master":
             variants = parsed["variants"]
+            # ✅ Sort by bandwidth descending (highest quality first)
             variants.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
 
+            # ✅ NEW: Log all available qualities
             log(f"[HLS] Master playlist contains {len(variants)} variants:")
             for i, v in enumerate(variants, 1):
                 resolution = v.get("resolution", "unknown")
@@ -513,7 +542,7 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
     consecutive_playlist_errors = 0
     consecutive_segment_errors = 0
     last_status_update = 0
-    last_session_refresh = time.time()
+    last_session_refresh = time.time()  # ✅ جديد: تتبع وقت آخر refresh
     recording_start_time = time.time()
     start_time_iso = datetime.now(timezone.utc).isoformat()
 
@@ -523,6 +552,7 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
         f"Start recording {RECORD_ID}"
     )
 
+    # ✅ جديد: متغير للتحكم في فحص الإيقاف كل 30 ثانية
     stop_check_counter = 0
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -565,30 +595,37 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
             if time.time() - last_session_refresh > SESSION_REFRESH_INTERVAL:
                 log(f"[SESSION] 🔄 Refreshing browser session ({SESSION_REFRESH_INTERVAL // 60}min passed)...")
                 try:
+                    # إغلاق المتصفح القديم
                     try:
                         await context.close()
                     except Exception:
                         pass
 
+                    # فتح context جديد
                     context = await playwright.chromium.new_context(
                         viewport={"width": 1280, "height": 720},
                         user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
                     )
                     page = await context.new_page()
 
+                    # إعادة ربط الـ response handler
                     async def handle_response(response):
+                        # لا نحتاج لعمل شيء هنا، فقط للحفاظ على الاتصال
                         pass
 
                     page.on("response", handle_response)
 
+                    # إعادة فتح الصفحة
                     try:
                         await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
                         last_session_refresh = time.time()
                         log("[SESSION] ✅ Session refreshed successfully")
                     except Exception as goto_exc:
                         log(f"[SESSION] ⚠️ Could not reload page: {goto_exc}")
+                        # الاستمرار بالـ session الجديد حتى لو فشل إعادة التحميل
                 except Exception as exc:
                     log(f"[SESSION] ⚠️ Refresh failed: {exc}")
+                    # الاستمرار بالـ session القديم كـ fallback
 
             try:
                 current_headers = await build_browser_session(page, context)
@@ -715,11 +752,11 @@ def mux_segments(segment_files):
     # ✅ تحسين #2: FFmpeg flags للبثوث الطويلة
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-        "-fflags", "+discardcorrupt+genpts",
+        "-fflags", "+discardcorrupt+genpts",  # ✅ جديد: إصلاح timestamps التالفة
         "-f", "concat", "-safe", "0", "-i", str(concat_file),
         "-c", "copy",
         "-movflags", "+faststart",
-        "-avoid_negative_ts", "make_zero",
+        "-avoid_negative_ts", "make_zero",  # ✅ جديد: منع timestamps سالبة
         str(output_file),
     ]
 
@@ -999,6 +1036,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
     full_size_mb = output_file.stat().st_size / 1024 / 1024
     log(f"[TELEGRAM] Final MP4 size: {full_size_mb:.2f} MB")
 
+    # ✅ جديد: تنسيق المدة بشكل أفضل
     duration_mins = duration_seconds // 60
     duration_hours = duration_mins // 60
     duration_mins_remaining = duration_mins % 60
@@ -1009,6 +1047,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
         duration_str = f"{duration_mins}m"
 
     if full_size_mb < TELEGRAM_MAX_MB:
+        # ✅ تحسين #4: رسالة مفصلة
         await send_message(
             f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
             f"👤 {TARGET_USERNAME}\n"
@@ -1021,6 +1060,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
         uploaded = await send_video_file(output_file)
         return uploaded
 
+    # ✅ تحسين #4: رسالة مفصلة للتسجيلات الكبيرة
     await send_message(
         f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
         f"👤 {TARGET_USERNAME}\n"
@@ -1069,7 +1109,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
 # ============================================================
 async def main():
     if not PAGE_URL:
-        print("Usage: python record_once.py \"https://example.com/stream/...\"")
+        print('Usage: python record_once.py "https://example.com/stream/..."')
         return 1
 
     log("Starting persistent HLS recorder...")
@@ -1232,21 +1272,14 @@ async def main():
     return 0
 
 # ============================================================
-# AUTO MEDIA ASSETS FEATURE v2 - START
+# One high-quality contact sheet per full broadcast
 # ============================================================
-_ASSET_FEATURE_INSTALLED = True
+_BROADCAST_CONTACT_FRAME_COUNT = 12
+_BROADCAST_CONTACT_COLS = 4
+_BROADCAST_CONTACT_MAX_BYTES = int(9 * 1024 * 1024)
+_BROADCAST_FFMPEG_TIMEOUT = 900
 
-_ASSET_THUMBNAIL_MAX_BYTES = 190 * 1024
-_ASSET_BACKGROUND_MAX_BYTES = 2 * 1024 * 1024
-_ASSET_CONTACT_MAX_BYTES = 4 * 1024 * 1024
-_ASSET_CONTACT_MAX_FRAMES = 120
-_ASSET_CONTACT_GENERATION_TIMEOUT = 420
-_ASSET_FRAME_WIDTH = 208
-_ASSET_BACKGROUND_WIDTH = 1280
-_ASSET_BACKGROUND_HEIGHT = 720
-_ASSET_FFMPEG_TIMEOUT = 600
-
-_ASSET_FONT_CANDIDATES = [
+_BROADCAST_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -1254,24 +1287,24 @@ _ASSET_FONT_CANDIDATES = [
 ]
 
 
-def _asset_run(command, timeout=_ASSET_FFMPEG_TIMEOUT, log_error=True):
+def _broadcast_run_command(command, timeout=_BROADCAST_FFMPEG_TIMEOUT, log_error=True):
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0 and log_error:
             stderr_tail = (result.stderr or "")[-1200:]
-            log(f"[ASSETS] Command returned {result.returncode}: {stderr_tail}")
+            log(f"[CONTACT] Command returned {result.returncode}: {stderr_tail}")
         return result
     except subprocess.TimeoutExpired:
         cmd_hint = " ".join(str(item) for item in command[:6])
-        log(f"[ASSETS] Command timed out after {timeout}s: {cmd_hint}")
+        log(f"[CONTACT] Command timed out after {timeout}s: {cmd_hint}")
         return None
     except Exception as exc:
-        log(f"[ASSETS] Command exception: {exc}")
+        log(f"[CONTACT] Command exception: {exc}")
         return None
 
 
-def _asset_find_font():
-    for candidate in _ASSET_FONT_CANDIDATES:
+def _broadcast_find_font():
+    for candidate in _BROADCAST_FONT_CANDIDATES:
         try:
             if Path(candidate).exists():
                 return candidate
@@ -1280,54 +1313,71 @@ def _asset_find_font():
     return None
 
 
-def _asset_drawtext_filter(text, font_path):
-    options = [f"text='{text}'"]
+def _broadcast_drawtext_filter(text, font_path):
+    safe_text = str(text).replace(":", r"\:")
+    options = [f"text='{safe_text}'"]
     if font_path:
         options.append(f"fontfile={font_path}")
     options.extend([
         "fontcolor=white",
-        "fontsize=18",
+        "fontsize=28",
         "box=1",
         "boxcolor=black@0.65",
-        "x=6",
-        "y=6",
+        "x=10",
+        "y=10",
     ])
     return "drawtext=" + ":".join(options)
 
 
-def _asset_make_asset_dir(file_path):
-    base = WORK_DIR / "assets"
-    base.mkdir(parents=True, exist_ok=True)
-    stamp = int(time.time() * 1000000)
+def _broadcast_format_timestamp(seconds):
+    try:
+        total = int(max(0, float(seconds)))
+    except Exception:
+        total = 0
 
-    while True:
-        name = safe_filename(f"{RECORD_ID}_{file_path.stem}_{os.getpid()}_{stamp}")
-        asset_dir = base / name
-        try:
-            asset_dir.mkdir(parents=False, exist_ok=False)
-            return asset_dir
-        except FileExistsError:
-            stamp += 1
-        except Exception:
-            asset_dir.mkdir(parents=True, exist_ok=True)
-            return asset_dir
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
-def _asset_get_duration_seconds(file_path):
+def _broadcast_duration_text(seconds):
+    try:
+        total = int(max(0, float(seconds)))
+    except Exception:
+        total = 0
+
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    if minutes > 0:
+        return f"{minutes}m"
+    return f"{secs}s"
+
+
+def _broadcast_get_duration_seconds(file_path, fallback_duration=0.0):
     probe_cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(file_path),
     ]
-    result = _asset_run(probe_cmd, timeout=60, log_error=False)
+    result = _broadcast_run_command(probe_cmd, timeout=60, log_error=False)
     if result is not None and result.returncode == 0:
         try:
-            return max(0.0, float(result.stdout.strip()))
+            value = float(result.stdout.strip())
+            if value > 0:
+                return value
         except Exception:
             pass
 
-    result = _asset_run(["ffmpeg", "-hide_banner", "-i", str(file_path)], timeout=30, log_error=False)
+    result = _broadcast_run_command(["ffmpeg", "-hide_banner", "-i", str(file_path)], timeout=30, log_error=False)
     if result is not None:
         match = re.search(r"Duration:\s*(\d+):(\d+):(\d+)\.(\d+)", result.stderr or "")
         if match:
@@ -1336,373 +1386,267 @@ def _asset_get_duration_seconds(file_path):
                 minutes = int(match.group(2))
                 seconds = int(match.group(3))
                 centis = int(match.group(4)[:2].ljust(2, "0"))
-                return float(hours * 3600 + minutes * 60 + seconds) + (centis / 100.0)
+                value = float(hours * 3600 + minutes * 60 + seconds) + (centis / 100.0)
+                if value > 0:
+                    return value
             except Exception:
                 pass
+
+    try:
+        fallback = float(fallback_duration)
+        if fallback > 0:
+            return fallback
+    except Exception:
+        pass
 
     return 0.0
 
 
-def _asset_downscale_image(image_path, max_bytes, initial_width):
-    if not image_path or not image_path.exists():
-        return False
-    if image_path.stat().st_size <= max_bytes:
-        return True
-
-    widths = [initial_width, 480, 320, 240]
-    qualities = [5, 6, 7, 8]
-
-    for width in widths:
-        for quality in qualities:
-            tmp_path = image_path.with_suffix(f".tmp_{width}_{quality}.jpg")
-            cmd = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", str(image_path),
-                "-vf", f"scale={width}:-2",
-                "-q:v", str(quality),
-                str(tmp_path),
-            ]
-            result = _asset_run(cmd, timeout=120, log_error=False)
-            if result is not None and result.returncode == 0 and tmp_path.exists():
-                if tmp_path.stat().st_size <= max_bytes:
-                    try:
-                        tmp_path.replace(image_path)
-                        return True
-                    except Exception as exc:
-                        log(f"[ASSETS] Could not replace downscaled image: {exc}")
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-    return image_path.exists() and image_path.stat().st_size <= max_bytes
-
-
-def _asset_extract_thumbnail(file_path, asset_dir):
-    thumb_path = asset_dir / f"{safe_filename(file_path.stem)}_thumb.jpg"
-
-    commands = [
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(file_path),
-            "-map", "0:v:0",
-            "-vf", "thumbnail=100,scale=640:-2",
-            "-frames:v", "1",
-            "-q:v", "5",
-            str(thumb_path),
-        ],
-    ]
-
-    for seek_position in ("2", "10", "30", "60"):
-        commands.append(
-            [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", seek_position,
-                "-i", str(file_path),
-                "-map", "0:v:0",
-                "-vf", "scale=640:-2",
-                "-frames:v", "1",
-                "-q:v", "5",
-                str(thumb_path),
-            ]
-        )
-
-    commands.append(
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(file_path),
-            "-map", "0:v:0",
-            "-vf", "scale=640:-2",
-            "-frames:v", "1",
-            "-q:v", "5",
-            str(thumb_path),
-        ]
-    )
-
-    for cmd in commands:
-        try:
-            if thumb_path.exists():
-                thumb_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-        result = _asset_run(cmd, timeout=180, log_error=False)
-        if result is not None and result.returncode == 0 and thumb_path.exists() and thumb_path.stat().st_size > 0:
-            if _asset_downscale_image(thumb_path, _ASSET_THUMBNAIL_MAX_BYTES, 640):
-                return thumb_path
-            log("[ASSETS] Generated thumbnail remained too large after downscaling attempts.")
-
-    return None
-
-
-def _asset_generate_background(file_path, asset_dir):
-    bg_path = asset_dir / f"{safe_filename(file_path.stem)}_background.jpg"
-
-    vf_blur = (
-        "thumbnail=100,"
-        f"scale={_ASSET_BACKGROUND_WIDTH}:{_ASSET_BACKGROUND_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={_ASSET_BACKGROUND_WIDTH}:{_ASSET_BACKGROUND_HEIGHT},"
-        "boxblur=20:2"
-    )
-    vf_plain = (
-        "thumbnail=100,"
-        f"scale={_ASSET_BACKGROUND_WIDTH}:{_ASSET_BACKGROUND_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={_ASSET_BACKGROUND_WIDTH}:{_ASSET_BACKGROUND_HEIGHT}"
-    )
-
-    commands = [
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(file_path),
-            "-map", "0:v:0",
-            "-vf", vf_blur,
-            "-frames:v", "1",
-            "-q:v", "5",
-            str(bg_path),
-        ],
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(file_path),
-            "-map", "0:v:0",
-            "-vf", vf_plain,
-            "-frames:v", "1",
-            "-q:v", "5",
-            str(bg_path),
-        ],
-    ]
-
-    for seek_position in ("2", "10", "30"):
-        commands.append(
-            [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", seek_position,
-                "-i", str(file_path),
-                "-map", "0:v:0",
-                "-vf", vf_plain,
-                "-frames:v", "1",
-                "-q:v", "5",
-                str(bg_path),
-            ]
-        )
-
-    commands.append(
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(file_path),
-            "-map", "0:v:0",
-            "-vf", vf_plain,
-            "-frames:v", "1",
-            "-q:v", "5",
-            str(bg_path),
-        ]
-    )
-
-    for cmd in commands:
-        try:
-            if bg_path.exists():
-                bg_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-        result = _asset_run(cmd, timeout=180, log_error=False)
-        if result is not None and result.returncode == 0 and bg_path.exists() and bg_path.stat().st_size > 0:
-            if _asset_downscale_image(bg_path, _ASSET_BACKGROUND_MAX_BYTES, _ASSET_BACKGROUND_WIDTH):
-                return bg_path
-            log("[ASSETS] Generated background remained too large after downscaling attempts.")
-
-    return None
-
-
-def _asset_extract_frame(file_path, timestamp, frame_path, label=None, font_path=None, use_label=True):
+def _broadcast_extract_frame(video_path, target_seconds, duration_seconds, frame_path, label, font_path, use_label):
     try:
         if frame_path.exists():
             frame_path.unlink(missing_ok=True)
     except Exception:
         pass
 
-    vf = f"scale={_ASSET_FRAME_WIDTH}:-2"
-    if use_label and label is not None:
-        vf += "," + _asset_drawtext_filter(str(label), font_path)
+    window = 6.0
 
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-ss", f"{max(0.0, float(timestamp)):.3f}",
-        "-i", str(file_path),
-        "-map", "0:v:0",
-        "-vf", vf,
-        "-frames:v", "1",
-        "-q:v", "5",
-        str(frame_path),
-    ]
-    result = _asset_run(cmd, timeout=60, log_error=False)
-    return result is not None and result.returncode == 0 and frame_path.exists() and frame_path.stat().st_size > 0
+    if duration_seconds and duration_seconds > 0:
+        start = max(0.0, min(float(target_seconds) - window / 2.0, duration_seconds - window))
+        actual_window = min(window, max(0.5, duration_seconds - start))
+        exact_target = max(0.0, min(float(target_seconds), duration_seconds - 0.1))
+    else:
+        start = max(0.0, float(target_seconds) - window / 2.0)
+        actual_window = window
+        exact_target = max(0.0, float(target_seconds))
 
+    label_filter = _broadcast_drawtext_filter(label, font_path) if (use_label and label) else ""
 
-def _asset_generate_contact_sheet(file_path, asset_dir):
-    duration = _asset_get_duration_seconds(file_path)
-    contact_path = asset_dir / f"{safe_filename(file_path.stem)}_contact.jpg"
-    frames_dir = asset_dir / f"{safe_filename(file_path.stem)}_frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
+    attempts = []
+    if label_filter:
+        attempts.append((f"thumbnail=120,{label_filter}", start, actual_window))
+        attempts.append((label_filter, exact_target, 0.0))
 
-    for old_file in frames_dir.glob("*.jpg"):
+    attempts.append(("thumbnail=120", start, actual_window))
+    attempts.append((None, exact_target, 0.0))
+
+    for vf, seek_pos, window_size in attempts:
         try:
-            old_file.unlink(missing_ok=True)
+            if frame_path.exists():
+                frame_path.unlink(missing_ok=True)
         except Exception:
             pass
 
-    if duration <= 0:
-        total_minutes = 1
-    else:
-        total_minutes = int(duration // 60)
-        if duration % 60 > 0:
-            total_minutes += 1
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        if seek_pos > 0:
+            cmd += ["-ss", f"{seek_pos:.3f}"]
+        if window_size > 0:
+            cmd += ["-t", f"{window_size:.3f}"]
 
-    if total_minutes < 1:
-        total_minutes = 1
+        cmd += ["-i", str(video_path), "-map", "0:v:0"]
 
-    step_minutes = 1
-    if total_minutes > _ASSET_CONTACT_MAX_FRAMES:
-        step_minutes = (total_minutes + _ASSET_CONTACT_MAX_FRAMES - 1) // _ASSET_CONTACT_MAX_FRAMES
+        if vf:
+            cmd += ["-vf", vf]
 
-    selected_minutes = list(range(0, total_minutes, step_minutes))
-    if selected_minutes and selected_minutes[-1] != total_minutes - 1 and len(selected_minutes) < _ASSET_CONTACT_MAX_FRAMES:
-        selected_minutes.append(total_minutes - 1)
+        cmd += ["-frames:v", "1", "-q:v", "1", str(frame_path)]
 
-    font_path = _asset_find_font()
-    label_available = True
-    frames = []
-    started = time.time()
+        result = _broadcast_run_command(cmd, timeout=180, log_error=False)
+        if result is not None and result.returncode == 0 and frame_path.exists() and frame_path.stat().st_size > 0:
+            return True
 
-    for minute_index in selected_minutes:
-        if time.time() - started > _ASSET_CONTACT_GENERATION_TIMEOUT:
-            log("[ASSETS] Contact sheet generation stopped early due to time limit.")
-            break
+    return False
 
-        frame_path = frames_dir / f"frame_{len(frames) + 1:04d}.jpg"
-        label_text = str(minute_index + 1)
 
-        if duration <= 0:
-            candidates = [0.0]
-        else:
-            base = minute_index * 60.0
-            minute_end = min(duration, base + 60.0)
-            remaining = max(0.1, minute_end - base)
+def _broadcast_compress_image(image_path, max_bytes):
+    if not image_path or not image_path.exists():
+        return False
+    if image_path.stat().st_size <= max_bytes:
+        return True
 
-            raw_candidates = []
-            for offset in (2.0, 5.0, 10.0, 20.0, 30.0):
-                t = base + offset
-                if t < duration - 0.1:
-                    raw_candidates.append(t)
+    tmp_path = image_path.with_suffix(".tmp.jpg")
 
-            mid = base + min(30.0, remaining / 2.0)
-            if mid < duration - 0.1:
-                raw_candidates.append(mid)
-
-            raw_candidates.append(base + 0.1)
-            raw_candidates.append(max(0.0, duration - 0.2))
-
-            candidates = []
-            seen = set()
-            for t in raw_candidates:
-                if t < 0.0:
-                    t = 0.0
-                key = round(t, 2)
-                if key not in seen:
-                    seen.add(key)
-                    candidates.append(t)
-
-        extracted = False
-
-        for t in candidates:
-            if label_available:
-                if _asset_extract_frame(file_path, t, frame_path, label_text, font_path, True):
-                    extracted = True
-                    break
-
-                if _asset_extract_frame(file_path, t, frame_path, label_text, font_path, False):
-                    label_available = False
-                    extracted = True
-                    break
-            else:
-                if _asset_extract_frame(file_path, t, frame_path, label_text, font_path, False):
-                    extracted = True
-                    break
-
-        if extracted:
-            frames.append(frame_path)
-        else:
-            log(f"[ASSETS] Could not extract a contact frame for minute {minute_index + 1}.")
-
-    if not frames:
-        shutil.rmtree(frames_dir, ignore_errors=True)
-        return None
-
-    if len(frames) == 1:
-        try:
-            shutil.copyfile(frames[0], contact_path)
-        except Exception as exc:
-            log(f"[ASSETS] Could not copy single contact frame: {exc}")
-    else:
-        frame_count = len(frames)
-        cols = 1
-        while cols * cols < frame_count:
-            cols += 1
-        rows = (frame_count + cols - 1) // cols
-
-        tile_cmd = [
+    for quality in (2, 3, 4, 5):
+        cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-start_number", "1",
-            "-i", str(frames_dir / "frame_%04d.jpg"),
-            "-vf", f"tile={cols}x{rows}",
-            "-frames:v", "1",
-            "-q:v", "5",
-            str(contact_path),
+            "-i", str(image_path),
+            "-q:v", str(quality),
+            str(tmp_path),
         ]
-        result = _asset_run(tile_cmd, timeout=300, log_error=True)
-
-        if result is None or result.returncode != 0 or not contact_path.exists() or contact_path.stat().st_size == 0:
+        result = _broadcast_run_command(cmd, timeout=180, log_error=False)
+        if result is not None and result.returncode == 0 and tmp_path.exists():
+            if tmp_path.stat().st_size <= max_bytes:
+                try:
+                    tmp_path.replace(image_path)
+                    return True
+                except Exception as exc:
+                    log(f"[CONTACT] Could not replace compressed image: {exc}")
             try:
-                shutil.copyfile(frames[0], contact_path)
-            except Exception as exc:
-                log(f"[ASSETS] Could not fallback contact frame: {exc}")
-
-    if contact_path.exists() and contact_path.stat().st_size > _ASSET_CONTACT_MAX_BYTES:
-        tmp_contact = contact_path.with_suffix(".tmp.jpg")
-        for scale_expression in ("iw/2:-2", "iw/3:-2"):
-            cmd = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", str(contact_path),
-                "-vf", f"scale={scale_expression}",
-                "-q:v", "6",
-                str(tmp_contact),
-            ]
-            result = _asset_run(cmd, timeout=180, log_error=False)
-            if result is not None and result.returncode == 0 and tmp_contact.exists():
-                if tmp_contact.stat().st_size <= _ASSET_CONTACT_MAX_BYTES:
-                    try:
-                        tmp_contact.replace(contact_path)
-                        break
-                    except Exception:
-                        pass
-            try:
-                tmp_contact.unlink(missing_ok=True)
+                tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
 
-    shutil.rmtree(frames_dir, ignore_errors=True)
+    for scale_expression in ("trunc(iw*3/4/2)*2:-2", "trunc(iw/2/2)*2:-2", "trunc(iw/3/2)*2:-2"):
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(image_path),
+            "-vf", f"scale={scale_expression}",
+            "-q:v", "3",
+            str(tmp_path),
+        ]
+        result = _broadcast_run_command(cmd, timeout=180, log_error=False)
+        if result is not None and result.returncode == 0 and tmp_path.exists():
+            if tmp_path.stat().st_size <= max_bytes:
+                try:
+                    tmp_path.replace(image_path)
+                    return True
+                except Exception as exc:
+                    log(f"[CONTACT] Could not replace scaled image: {exc}")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-    if contact_path.exists() and contact_path.stat().st_size > 0:
-        return contact_path
-    return None
+    return image_path.exists() and image_path.stat().st_size <= max_bytes
 
 
-async def _asset_send_photo(file_path, caption):
+def _broadcast_generate_contact_sheet(video_path, fallback_duration=0.0):
+    work_dir = None
+
+    try:
+        if not video_path or not Path(video_path).exists():
+            log("[CONTACT] Full broadcast video does not exist.")
+            return None, None, fallback_duration, 0
+
+        contact_root = WORK_DIR / "contact_sheets"
+        contact_root.mkdir(parents=True, exist_ok=True)
+
+        work_dir = contact_root / f"{safe_filename(RECORD_ID)}_{os.getpid()}_{int(time.time() * 1000000)}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        for old_file in work_dir.glob("*.jpg"):
+            try:
+                old_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        duration = _broadcast_get_duration_seconds(video_path, fallback_duration)
+        count = _BROADCAST_CONTACT_FRAME_COUNT
+
+        if duration > 0:
+            if duration >= 60:
+                margin = min(30.0, duration * 0.03)
+            else:
+                margin = min(1.0, duration * 0.05)
+
+            start_t = margin
+            end_t = max(start_t + 0.1, duration - margin)
+
+            if count > 1:
+                step = (end_t - start_t) / (count - 1)
+            else:
+                step = 0.0
+
+            targets = [start_t + i * step for i in range(count)]
+        else:
+            targets = [float(i) for i in range(count)]
+
+        font_path = _broadcast_find_font()
+        label_available = True
+        frames = []
+
+        for idx, target in enumerate(targets, start=1):
+            candidate_path = work_dir / f"candidate_{idx:02d}.jpg"
+            label = _broadcast_format_timestamp(target)
+            extracted = False
+
+            if label_available:
+                if _broadcast_extract_frame(video_path, target, duration, candidate_path, label, font_path, True):
+                    extracted = True
+                elif _broadcast_extract_frame(video_path, target, duration, candidate_path, label, font_path, False):
+                    label_available = False
+                    extracted = True
+            else:
+                if _broadcast_extract_frame(video_path, target, duration, candidate_path, label, font_path, False):
+                    extracted = True
+
+            if extracted and candidate_path.exists():
+                final_frame = work_dir / f"frame_{len(frames) + 1:02d}.jpg"
+                try:
+                    candidate_path.replace(final_frame)
+                    frames.append(final_frame)
+                except Exception as exc:
+                    log(f"[CONTACT] Could not finalize frame {idx}: {exc}")
+                    try:
+                        frames.append(candidate_path)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    candidate_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                log(f"[CONTACT] Could not extract frame near {label}.")
+
+        if not frames:
+            log("[CONTACT] No frames could be extracted from the full broadcast.")
+            return None, work_dir, duration, 0
+
+        contact_path = work_dir / f"{safe_filename(RECORD_ID)}_full_contact.jpg"
+        frame_count = len(frames)
+        cols = min(_BROADCAST_CONTACT_COLS, frame_count)
+        rows = (frame_count + cols - 1) // cols
+
+        if frame_count == 1:
+            try:
+                shutil.copyfile(frames[0], contact_path)
+            except Exception as exc:
+                log(f"[CONTACT] Could not copy single contact frame: {exc}")
+        else:
+            tile_cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-start_number", "1",
+                "-i", str(work_dir / "frame_%02d.jpg"),
+                "-vf", f"tile={cols}x{rows}",
+                "-frames:v", "1",
+                "-q:v", "1",
+                str(contact_path),
+            ]
+            result = _broadcast_run_command(tile_cmd, timeout=300, log_error=True)
+
+            if result is None or result.returncode != 0 or not contact_path.exists() or contact_path.stat().st_size == 0:
+                try:
+                    shutil.copyfile(frames[0], contact_path)
+                except Exception as exc:
+                    log(f"[CONTACT] Could not fallback to first frame: {exc}")
+
+        if contact_path.exists():
+            _broadcast_compress_image(contact_path, _BROADCAST_CONTACT_MAX_BYTES)
+
+        for frame_path in frames:
+            try:
+                frame_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        if contact_path.exists() and contact_path.stat().st_size > 0:
+            log(f"[CONTACT] Full broadcast contact sheet ready: {contact_path.name} ({contact_path.stat().st_size} bytes)")
+            return contact_path, work_dir, duration, frame_count
+
+        return None, work_dir, duration, 0
+
+    except Exception as exc:
+        log(f"[CONTACT] Contact sheet generation failed: {exc}")
+        return None, work_dir, fallback_duration, 0
+
+
+async def _broadcast_send_photo(file_path, caption):
     if not BOT_TOKEN or not ADMIN_USER_ID:
         return False
-    if not file_path or not file_path.exists():
+    if not file_path or not Path(file_path).exists():
         return False
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    photo_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    document_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     timeout = aiohttp.ClientTimeout(total=180, connect=20, sock_read=150)
 
     for attempt in range(2):
@@ -1714,198 +1658,706 @@ async def _asset_send_photo(file_path, caption):
 
                 with file_path.open("rb") as photo_file:
                     form.add_field("photo", photo_file, filename=file_path.name, content_type="image/jpeg")
-                    async with session.post(url, data=form) as response:
+                    async with session.post(photo_url, data=form) as response:
                         text = await response.text()
-                        log(f"[ASSETS] sendPhoto: HTTP {response.status}")
+                        log(f"[CONTACT] sendPhoto: HTTP {response.status}")
                         if response.status != 200:
-                            log(f"[ASSETS] Response: {text[:3000]}")
+                            log(f"[CONTACT] Response: {text[:3000]}")
                         if response.status == 200:
                             return True
         except Exception as exc:
-            log(f"[ASSETS] Photo upload failed: {exc}")
+            log(f"[CONTACT] Photo upload failed: {exc}")
 
         if attempt == 0:
             await asyncio.sleep(3)
 
-    return False
-
-
-async def _asset_send_video_with_thumbnail(data, file_object, file_name, thumbnail_path):
-    if not BOT_TOKEN:
-        log("[TELEGRAM] BOT_TOKEN is missing.")
-        return None
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
-    timeout = aiohttp.ClientTimeout(total=180, connect=20, sock_read=150)
-
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             form = aiohttp.FormData()
-            for key, value in (data or {}).items():
-                form.add_field(key, str(value))
+            form.add_field("chat_id", str(ADMIN_USER_ID))
+            form.add_field("caption", str(caption))
 
-            form.add_field("video", file_object, filename=file_name, content_type="video/mp4")
-
-            if thumbnail_path and thumbnail_path.exists():
-                with thumbnail_path.open("rb") as thumb_file:
-                    form.add_field("thumbnail", thumb_file, filename=thumbnail_path.name, content_type="image/jpeg")
-                    async with session.post(url, data=form) as response:
-                        text = await response.text()
-                        log(f"[ASSETS] sendVideo+thumbnail: HTTP {response.status}")
-                        if response.status != 200:
-                            log(f"[ASSETS] Response: {text[:3000]}")
-                        return response.status, text
-
-            async with session.post(url, data=form) as response:
-                text = await response.text()
-                log(f"[ASSETS] sendVideo: HTTP {response.status}")
-                if response.status != 200:
-                    log(f"[ASSETS] Response: {text[:3000]}")
-                return response.status, text
+            with file_path.open("rb") as document_file:
+                form.add_field("document", document_file, filename=file_path.name, content_type="image/jpeg")
+                async with session.post(document_url, data=form) as response:
+                    text = await response.text()
+                    log(f"[CONTACT] sendDocument fallback: HTTP {response.status}")
+                    if response.status != 200:
+                        log(f"[CONTACT] Response: {text[:3000]}")
+                    if response.status == 200:
+                        return True
     except Exception as exc:
-        log(f"[ASSETS] Video upload with thumbnail error: {exc}")
+        log(f"[CONTACT] Document fallback failed: {exc}")
+
+    return False
+
+
+_BROADCAST_ORIGINAL_SEND_RECORDING = send_recording
+
+
+async def _broadcast_send_recording(output_file, segment_files, duration_seconds):
+    uploaded = await _BROADCAST_ORIGINAL_SEND_RECORDING(output_file, segment_files, duration_seconds)
+    work_dir = None
+
+    try:
+        if output_file and Path(output_file).exists():
+            contact_path, work_dir, used_duration, frame_count = _broadcast_generate_contact_sheet(
+                output_file,
+                duration_seconds,
+            )
+
+            if contact_path and Path(contact_path).exists():
+                if TARGET_USERNAME:
+                    caption = (
+                        f"🎬 صورة مجمعة واحدة للبث الكامل\n"
+                        f"👤 {TARGET_USERNAME}\n"
+                        f"🆔 #{RECORD_ID}\n"
+                        f"⏱️ المدة: {_broadcast_duration_text(used_duration)}\n"
+                        f"🖼️ {frame_count} لقطة موزعة على كامل البث"
+                    )
+                else:
+                    caption = (
+                        f"🎬 صورة مجمعة واحدة للبث الكامل\n"
+                        f"🆔 #{RECORD_ID}\n"
+                        f"⏱️ المدة: {_broadcast_duration_text(used_duration)}\n"
+                        f"🖼️ {frame_count} لقطة موزعة على كامل البث"
+                    )
+
+                sent = await _broadcast_send_photo(contact_path, caption)
+                if sent:
+                    log(f"[CONTACT] Full broadcast contact sheet sent for #{RECORD_ID}.")
+                else:
+                    log(f"[CONTACT] Full broadcast contact sheet could not be sent for #{RECORD_ID}.")
+            else:
+                log(f"[CONTACT] Full broadcast contact sheet could not be generated for #{RECORD_ID}.")
+        else:
+            log(f"[CONTACT] Full broadcast video is missing for #{RECORD_ID}.")
+    except Exception as exc:
+        log(f"[CONTACT] Full broadcast contact sheet stage failed: {exc}")
+    finally:
+        if work_dir:
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    return uploaded
+
+
+send_recording = _broadcast_send_recording
+
+# ============================================================
+# Active recording guard helpers
+# ============================================================
+def _guard_normalize_identity(value):
+    if not value:
+        return ""
+    value = str(value).strip().lstrip("@").lower()
+    value = re.sub(r"\s+", "", value)
+    return value
+
+
+def _guard_identity_key():
+    identity = _guard_normalize_identity(TARGET_USERNAME)
+    if not identity:
+        identity = _guard_normalize_identity(RECORD_ID)
+    return safe_filename(identity or "unknown")
+
+
+def _guard_user_lock_path(identity):
+    return f"{USER_LOCK_DIR}/{identity}.json"
+
+
+def _guard_parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _guard_age_seconds(value):
+    dt = _guard_parse_iso_datetime(value)
+    if not dt:
+        return None
+    age = (datetime.now(timezone.utc) - dt).total_seconds()
+    return max(0.0, age)
+
+
+async def _guard_github_api_request(method, path, body=None, timeout=20):
+    if not GITHUB_TOKEN:
+        return None, None
+
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "telegram-hls-recorder",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.request(method, url, headers=headers, json=body) as response:
+                text = await response.text()
+                data = None
+                if text:
+                    try:
+                        data = json.loads(text)
+                    except Exception:
+                        data = text
+                return response.status, data
+    except Exception as exc:
+        log(f"[GUARD] GitHub API {method} {path} failed: {exc}")
+        return None, None
+
+
+async def _guard_get_file(path):
+    status, data = await _guard_github_api_request("GET", path)
+
+    if status == 200 and isinstance(data, dict):
+        sha = data.get("sha")
+        encoded = data.get("content")
+        obj = None
+
+        if encoded:
+            try:
+                raw = base64.b64decode(encoded.replace("\n", "")).decode("utf-8", errors="replace")
+                obj = json.loads(raw)
+            except Exception as exc:
+                log(f"[GUARD] Could not decode {path}: {exc}")
+
+        return status, obj, sha
+
+    return status, None, None
+
+
+async def _guard_list_dir(path):
+    status, data = await _guard_github_api_request("GET", path)
+    if status == 200 and isinstance(data, list):
+        names = []
+        for item in data:
+            if isinstance(item, dict) and item.get("name"):
+                names.append(str(item.get("name")))
+        return names
+    return []
+
+
+async def _guard_put_json(path, obj, message, sha=None):
+    try:
+        encoded = base64.b64encode(json.dumps(obj, indent=2).encode("utf-8")).decode("utf-8")
+    except Exception as exc:
+        log(f"[GUARD] Could not encode {path}: {exc}")
+        return False, None
+
+    body = {"message": message, "content": encoded}
+    if sha:
+        body["sha"] = sha
+
+    status, data = await _guard_github_api_request("PUT", path, body)
+    if status in (200, 201):
+        new_sha = None
+        if isinstance(data, dict):
+            content_obj = data.get("content")
+            if isinstance(content_obj, dict):
+                new_sha = content_obj.get("sha")
+        return True, new_sha
+
+    log(f"[GUARD] PUT failed for {path}: HTTP {status}")
+    return False, None
+
+
+async def _guard_delete_file(path, message, sha=None):
+    if not sha:
+        status, _, sha = await _guard_get_file(path)
+        if status != 200 or not sha:
+            return False
+
+    body = {"message": message, "sha": sha}
+    status, _ = await _guard_github_api_request("DELETE", path, body)
+    return status in (200, 204)
+
+
+async def _guard_acquire_admission_lock(timeout_seconds=120):
+    if not GITHUB_TOKEN:
+        return True
+
+    started = time.time()
+    attempt = 0
+
+    while time.time() - started < timeout_seconds:
+        if await check_stop():
+            return False
+
+        status, obj, sha = await _guard_get_file(ADMISSION_LOCK_FILE)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "owner": RECORD_ID,
+            "acquired_at": now_iso,
+            "pid": os.getpid(),
+        }
+
+        if status == 404:
+            ok, _ = await _guard_put_json(
+                ADMISSION_LOCK_FILE,
+                payload,
+                f"Acquire admission lock {RECORD_ID}",
+            )
+            if ok:
+                return True
+        elif status == 200:
+            owner = obj.get("owner") if isinstance(obj, dict) else None
+            age = _guard_age_seconds(obj.get("acquired_at")) if isinstance(obj, dict) else None
+
+            if owner == RECORD_ID:
+                return True
+
+            if obj is None or age is None or age > ADMISSION_LOCK_TTL_SECONDS:
+                ok, _ = await _guard_put_json(
+                    ADMISSION_LOCK_FILE,
+                    payload,
+                    f"Take over stale admission lock {RECORD_ID}",
+                    sha=sha,
+                )
+                if ok:
+                    return True
+
+        await asyncio.sleep(min(5, 1 + attempt))
+        attempt += 1
+
+    return False
+
+
+async def _guard_release_admission_lock():
+    if not GITHUB_TOKEN:
+        return
+
+    try:
+        status, obj, sha = await _guard_get_file(ADMISSION_LOCK_FILE)
+        if status == 200 and sha:
+            owner = obj.get("owner") if isinstance(obj, dict) else None
+            age = _guard_age_seconds(obj.get("acquired_at")) if isinstance(obj, dict) else None
+            if owner == RECORD_ID or obj is None or age is None or age > ADMISSION_LOCK_TTL_SECONDS:
+                await _guard_delete_file(
+                    ADMISSION_LOCK_FILE,
+                    f"Release admission lock {RECORD_ID}",
+                    sha=sha,
+                )
+    except Exception as exc:
+        log(f"[GUARD] Could not release admission lock: {exc}")
+
+
+async def _guard_is_record_active(record_id, active_obj):
+    if not record_id:
+        return False
+
+    try:
+        status_status, status_obj, _ = await _guard_get_file(f"{STATUS_DIR}/{record_id}.json")
+        if isinstance(status_obj, dict):
+            age = _guard_age_seconds(status_obj.get("updated_at") or status_obj.get("timestamp"))
+            if age is not None and age < ACTIVE_STALE_SECONDS:
+                return True
+
+        if isinstance(active_obj, dict):
+            age = _guard_age_seconds(active_obj.get("updated_at") or active_obj.get("started_at"))
+            if age is not None and age < ACTIVE_STALE_SECONDS:
+                return True
+
+            identity = _guard_normalize_identity(active_obj.get("username") or active_obj.get("identity"))
+            if identity:
+                lock_status, lock_obj, _ = await _guard_get_file(_guard_user_lock_path(identity))
+                if isinstance(lock_obj, dict) and str(lock_obj.get("record_id", "")) == str(record_id):
+                    lock_age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
+                    if lock_age is None or lock_age < USER_LOCK_TTL_SECONDS:
+                        return True
+    except Exception as exc:
+        log(f"[GUARD] Active check failed for {record_id}: {exc}")
+
+    return False
+
+
+async def _guard_cleanup_stale_states():
+    if not GITHUB_TOKEN:
+        return
+
+    try:
+        active_names = await _guard_list_dir(ACTIVE_DIR)
+        removed_active = []
+
+        for name in active_names:
+            if not name.endswith(".json"):
+                continue
+
+            record_id = name[:-5]
+            if record_id == RECORD_ID:
+                continue
+
+            active_path = f"{ACTIVE_DIR}/{name}"
+            status, active_obj, _ = await _guard_get_file(active_path)
+            if status != 200:
+                continue
+
+            if await _guard_is_record_active(record_id, active_obj):
+                continue
+
+            log(f"[GUARD] Removing stale active record: {record_id}")
+            await github_delete_file(active_path, f"Remove stale active {record_id}")
+            await github_delete_file(f"{STATUS_DIR}/{record_id}.json", f"Remove stale status {record_id}")
+            removed_active.append(record_id)
+
+        if removed_active:
+            log(f"[GUARD] Removed stale active records: {', '.join(removed_active)}")
+
+        lock_names = await _guard_list_dir(USER_LOCK_DIR)
+        for name in lock_names:
+            if not name.endswith(".json"):
+                continue
+
+            lock_path = f"{USER_LOCK_DIR}/{name}"
+            status, lock_obj, sha = await _guard_get_file(lock_path)
+            if status != 200 or not isinstance(lock_obj, dict):
+                continue
+
+            record_id = str(lock_obj.get("record_id", ""))
+            age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
+            if age is None or age <= USER_LOCK_TTL_SECONDS:
+                continue
+
+            active_status, active_obj, _ = await _guard_get_file(f"{ACTIVE_DIR}/{record_id}.json") if record_id else (404, None, None)
+            if active_status == 200 and await _guard_is_record_active(record_id, active_obj):
+                continue
+
+            log(f"[GUARD] Removing stale user lock: {name} ({record_id})")
+            await _guard_delete_file(lock_path, f"Remove stale user lock {name}", sha=sha)
+    except Exception as exc:
+        log(f"[GUARD] Stale cleanup failed: {exc}")
+
+
+async def _guard_find_duplicate_identity(identity):
+    if not identity:
+        return None
+
+    try:
+        lock_path = _guard_user_lock_path(identity)
+        status, lock_obj, _ = await _guard_get_file(lock_path)
+
+        if status == 200 and isinstance(lock_obj, dict):
+            record_id = str(lock_obj.get("record_id", ""))
+            if record_id and record_id != RECORD_ID:
+                age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
+                if age is None or age < USER_LOCK_TTL_SECONDS:
+                    return record_id
+
+        active_names = await _guard_list_dir(ACTIVE_DIR)
+        for name in active_names:
+            if not name.endswith(".json"):
+                continue
+
+            record_id = name[:-5]
+            if record_id == RECORD_ID:
+                continue
+
+            status, active_obj, _ = await _guard_get_file(f"{ACTIVE_DIR}/{name}")
+            if status != 200 or not isinstance(active_obj, dict):
+                continue
+
+            other_identity = _guard_normalize_identity(active_obj.get("username") or active_obj.get("identity"))
+            if other_identity != identity:
+                continue
+
+            if await _guard_is_record_active(record_id, active_obj):
+                return record_id
+    except Exception as exc:
+        log(f"[GUARD] Duplicate identity check failed: {exc}")
 
     return None
 
 
-async def _asset_send_video_file(file_path, part_number=None, total_parts=None):
-    if not file_path or not file_path.exists():
-        log(f"[TELEGRAM] Output file does not exist: {file_path}")
-        return False
-
-    size_mb = file_path.stat().st_size / 1024 / 1024
-    log(f"[TELEGRAM] Video size: {size_mb:.2f} MB")
-
-    if size_mb >= TELEGRAM_MAX_MB:
-        log(f"[TELEGRAM] Refusing to upload a file too close to/over the Telegram limit: {size_mb:.2f} MB")
-        return False
-
-    if TARGET_USERNAME:
-        caption = f"🎥 تسجيل {TARGET_USERNAME} (#{RECORD_ID})\n"
-    else:
-        caption = f"🎥 التسجيل #{RECORD_ID}\n"
-
-    if part_number is not None:
-        caption += f"Part {part_number}"
-        if total_parts is not None:
-            caption += f" / {total_parts}"
-
-    asset_dir = None
-    thumbnail_path = None
+async def _guard_count_active_records():
+    active_ids = set()
 
     try:
-        asset_dir = _asset_make_asset_dir(file_path)
+        active_names = await _guard_list_dir(ACTIVE_DIR)
+        for name in active_names:
+            if not name.endswith(".json"):
+                continue
+
+            record_id = name[:-5]
+            if record_id == RECORD_ID:
+                continue
+
+            status, active_obj, _ = await _guard_get_file(f"{ACTIVE_DIR}/{name}")
+            if status != 200:
+                continue
+
+            if await _guard_is_record_active(record_id, active_obj):
+                active_ids.add(record_id)
+
+        lock_names = await _guard_list_dir(USER_LOCK_DIR)
+        for name in lock_names:
+            if not name.endswith(".json"):
+                continue
+
+            status, lock_obj, _ = await _guard_get_file(f"{USER_LOCK_DIR}/{name}")
+            if status != 200 or not isinstance(lock_obj, dict):
+                continue
+
+            record_id = str(lock_obj.get("record_id", ""))
+            if not record_id or record_id == RECORD_ID:
+                continue
+
+            age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
+            if age is None or age < USER_LOCK_TTL_SECONDS:
+                active_ids.add(record_id)
     except Exception as exc:
-        log(f"[ASSETS] Could not create asset directory: {exc}")
+        log(f"[GUARD] Active count failed: {exc}")
 
-    if asset_dir:
-        try:
-            thumbnail_path = _asset_extract_thumbnail(file_path, asset_dir)
-            if thumbnail_path:
-                log(f"[ASSETS] Thumbnail ready: {thumbnail_path.name} ({thumbnail_path.stat().st_size} bytes)")
-            else:
-                log("[ASSETS] Could not generate thumbnail; continuing without it.")
-        except Exception as exc:
-            log(f"[ASSETS] Thumbnail generation failed: {exc}")
-            thumbnail_path = None
+    return len(active_ids)
 
-    upload_succeeded = False
+
+async def _guard_acquire_user_lock(identity):
+    lock_path = _guard_user_lock_path(identity)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    payload = {
+        "record_id": RECORD_ID,
+        "identity": identity,
+        "username": TARGET_USERNAME,
+        "url": PAGE_URL,
+        "started_at": now_iso,
+        "updated_at": now_iso,
+        "pid": os.getpid(),
+        "max_active_recordings": MAX_ACTIVE_RECORDINGS,
+    }
+
+    status, existing_obj, existing_sha = await _guard_get_file(lock_path)
+
+    if status == 200 and existing_sha:
+        existing_record_id = str(existing_obj.get("record_id", "")) if isinstance(existing_obj, dict) else ""
+        age = _guard_age_seconds(existing_obj.get("updated_at") or existing_obj.get("started_at")) if isinstance(existing_obj, dict) else None
+
+        if existing_record_id and existing_record_id != RECORD_ID and (age is None or age < USER_LOCK_TTL_SECONDS):
+            return False, existing_record_id, existing_sha
+
+        if isinstance(existing_obj, dict):
+            payload["started_at"] = existing_obj.get("started_at") or now_iso
+
+        ok, new_sha = await _guard_put_json(
+            lock_path,
+            payload,
+            f"Acquire user lock {identity} for {RECORD_ID}",
+            sha=existing_sha,
+        )
+        if ok:
+            return True, None, new_sha
+        return False, "update_failed", new_sha
+
+    if status == 404:
+        ok, new_sha = await _guard_put_json(
+            lock_path,
+            payload,
+            f"Acquire user lock {identity} for {RECORD_ID}",
+        )
+        if ok:
+            return True, None, new_sha
+        return False, "create_failed_or_conflict", None
+
+    return False, f"github_status_{status}", None
+
+
+async def _guard_touch_user_lock():
+    if not GITHUB_TOKEN:
+        return
+
+    identity = _guard_identity_key()
+    lock_path = _guard_user_lock_path(identity)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    status, obj, sha = await _guard_get_file(lock_path)
+
+    if status == 200 and sha and isinstance(obj, dict) and str(obj.get("record_id", "")) == RECORD_ID:
+        obj["updated_at"] = now_iso
+        obj["identity"] = identity
+        obj["username"] = TARGET_USERNAME
+        await _guard_put_json(
+            lock_path,
+            obj,
+            f"Heartbeat user lock {identity} {RECORD_ID}",
+            sha=sha,
+        )
+        return
+
+    if status == 404:
+        payload = {
+            "record_id": RECORD_ID,
+            "identity": identity,
+            "username": TARGET_USERNAME,
+            "url": PAGE_URL,
+            "started_at": now_iso,
+            "updated_at": now_iso,
+            "pid": os.getpid(),
+            "max_active_recordings": MAX_ACTIVE_RECORDINGS,
+        }
+        await _guard_put_json(
+            lock_path,
+            payload,
+            f"Restore user lock {identity} for {RECORD_ID}",
+        )
+
+
+async def _guard_release_user_lock():
+    if not GITHUB_TOKEN:
+        return
+
+    identity = _guard_identity_key()
+    lock_path = _guard_user_lock_path(identity)
+
+    status, obj, sha = await _guard_get_file(lock_path)
+    if status == 200 and sha and isinstance(obj, dict):
+        record_id = str(obj.get("record_id", ""))
+        if record_id == RECORD_ID:
+            await _guard_delete_file(lock_path, f"Release user lock {identity} {RECORD_ID}", sha=sha)
+
+
+async def _guard_reserve_active_file(identity):
+    active_path = f"{ACTIVE_DIR}/{RECORD_ID}.json"
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    payload = {
+        "record_id": RECORD_ID,
+        "url": PAGE_URL,
+        "username": TARGET_USERNAME,
+        "identity": identity,
+        "started_at": now_iso,
+        "updated_at": now_iso,
+        "hls_status": "reserved",
+        "source": "record_once_guard",
+    }
+
+    status, existing_obj, existing_sha = await _guard_get_file(active_path)
+    if status == 200 and isinstance(existing_obj, dict):
+        payload["started_at"] = existing_obj.get("started_at") or now_iso
+
+    ok, _ = await _guard_put_json(
+        active_path,
+        payload,
+        f"Reserve active slot {RECORD_ID}",
+        sha=existing_sha if status == 200 else None,
+    )
+    return ok
+
+
+async def _acquire_broadcast_slot():
+    if not GITHUB_TOKEN:
+        log("[GUARD] GITHUB_TOKEN is missing; distributed active-recording guard is disabled.")
+        return True
 
     try:
-        MAX_UPLOAD_RETRIES = 3
+        if await check_stop():
+            log("[GUARD] Stop signal detected before acquiring a recording slot.")
+            return False
 
-        for attempt in range(MAX_UPLOAD_RETRIES):
-            try:
-                log(f"[TELEGRAM] Uploading video (attempt {attempt+1}): {file_path.name}")
+        identity = _guard_identity_key()
 
-                with file_path.open("rb") as file:
-                    if thumbnail_path and thumbnail_path.exists() and thumbnail_path.stat().st_size <= _ASSET_THUMBNAIL_MAX_BYTES:
-                        result = await _asset_send_video_with_thumbnail(
-                            {"chat_id": ADMIN_USER_ID, "caption": caption, "supports_streaming": "true"},
-                            file,
-                            file_path.name,
-                            thumbnail_path,
-                        )
-                    else:
-                        result = await telegram_request(
-                            "sendVideo",
-                            data={"chat_id": ADMIN_USER_ID, "caption": caption, "supports_streaming": "true"},
-                            file_data=file,
-                            file_name=file_path.name,
-                        )
+        admission_ok = await _guard_acquire_admission_lock(timeout_seconds=120)
+        if not admission_ok:
+            log("[GUARD] Could not acquire admission lock; refusing to start to avoid race conditions.")
+            return False
 
-                if result and result[0] == 200:
-                    log(f"[TELEGRAM] Video uploaded successfully: {file_path.name}")
-                    upload_succeeded = True
-                    break
+        try:
+            await _guard_cleanup_stale_states()
 
-                log(f"[TELEGRAM] Video upload failed (attempt {attempt+1}): {file_path.name}")
-                if thumbnail_path:
-                    log("[ASSETS] Retrying without thumbnail because upload with thumbnail failed.")
-                    thumbnail_path = None
+            duplicate_record_id = await _guard_find_duplicate_identity(identity)
+            if duplicate_record_id:
+                log(f"[GUARD] Another active recording exists for identity '{identity}': #{duplicate_record_id}. Skipping #{RECORD_ID}.")
+                return False
 
-            except Exception as exc:
-                log(f"[TELEGRAM] Upload failed: {exc}")
-                if thumbnail_path:
-                    thumbnail_path = None
+            active_count = await _guard_count_active_records()
+            if active_count >= MAX_ACTIVE_RECORDINGS:
+                log(f"[GUARD] Active recordings {active_count}/{MAX_ACTIVE_RECORDINGS}. Skipping #{RECORD_ID}.")
+                return False
 
-            if attempt < MAX_UPLOAD_RETRIES - 1:
-                wait_time = 5 * (attempt + 1)
-                log(f"[TELEGRAM] Retrying in {wait_time} seconds...")
-                await asyncio.sleep(wait_time)
+            lock_ok, lock_reason, _ = await _guard_acquire_user_lock(identity)
+            if not lock_ok:
+                log(f"[GUARD] Could not acquire user lock for '{identity}': {lock_reason}")
+                return False
 
-        if upload_succeeded:
-            if asset_dir:
-                background_path = None
-                try:
-                    background_path = _asset_generate_background(file_path, asset_dir)
-                    if background_path:
-                        log(f"[ASSETS] Background ready: {background_path.name} ({background_path.stat().st_size} bytes)")
-                    else:
-                        log("[ASSETS] Could not generate background.")
-                except Exception as exc:
-                    log(f"[ASSETS] Background generation failed: {exc}")
+            if not await _guard_reserve_active_file(identity):
+                await _guard_release_user_lock()
+                log("[GUARD] Could not reserve active file after acquiring user lock.")
+                return False
 
-                if background_path and background_path.exists():
-                    background_caption = caption + "\n🎨 خلفية خاصة بهذا المقطع"
-                    background_sent = await _asset_send_photo(background_path, background_caption)
-                    if not background_sent:
-                        log("[ASSETS] Background photo could not be sent; video delivery already succeeded.")
-
-                contact_path = None
-                try:
-                    contact_path = _asset_generate_contact_sheet(file_path, asset_dir)
-                    if contact_path:
-                        log(f"[ASSETS] Contact sheet ready: {contact_path.name} ({contact_path.stat().st_size} bytes)")
-                    else:
-                        log("[ASSETS] Could not generate contact sheet.")
-                except Exception as exc:
-                    log(f"[ASSETS] Contact sheet generation failed: {exc}")
-
-                if contact_path and contact_path.exists():
-                    contact_caption = caption + "\n🗓️ معاينة الدقائق الخاصة بهذا المقطع"
-                    contact_sent = await _asset_send_photo(contact_path, contact_caption)
-                    if not contact_sent:
-                        log("[ASSETS] Contact sheet photo could not be sent; video delivery already succeeded.")
-
+            log(f"[GUARD] Slot acquired: {active_count + 1}/{MAX_ACTIVE_RECORDINGS} active, identity='{identity}', record=#{RECORD_ID}.")
             return True
-
+        finally:
+            await _guard_release_admission_lock()
+    except Exception as exc:
+        log(f"[GUARD] Slot acquisition failed: {exc}")
         return False
 
+
+async def _release_broadcast_slot():
+    try:
+        await _guard_release_user_lock()
+    except Exception as exc:
+        log(f"[GUARD] Could not release user lock: {exc}")
+
+    try:
+        await github_delete_file(f"{ACTIVE_DIR}/{RECORD_ID}.json", f"Remove guarded active {RECORD_ID}")
+    except Exception as exc:
+        log(f"[GUARD] Could not remove guarded active file: {exc}")
+
+    try:
+        await github_delete_file(f"{STATUS_DIR}/{RECORD_ID}.json", f"Remove guarded status {RECORD_ID}")
+    except Exception as exc:
+        log(f"[GUARD] Could not remove guarded status file: {exc}")
+
+
+_ORIGINAL_GITHUB_UPDATE_FILE = github_update_file
+
+
+async def _guarded_github_update_file(path, content_dict, message):
+    is_status_update = (path == f"{STATUS_DIR}/{RECORD_ID}.json")
+
+    if is_status_update and isinstance(content_dict, dict):
+        content_dict = dict(content_dict)
+        content_dict["record_id"] = RECORD_ID
+        content_dict["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = await _ORIGINAL_GITHUB_UPDATE_FILE(path, content_dict, message)
+
+    if is_status_update:
+        try:
+            await _guard_touch_user_lock()
+        except Exception as exc:
+            log(f"[GUARD] Status heartbeat failed: {exc}")
+
+    return result
+
+
+github_update_file = _guarded_github_update_file
+
+_ORIGINAL_MAIN_FUNCTION = main
+
+
+async def _guarded_main():
+    allowed = await _acquire_broadcast_slot()
+    if not allowed:
+        log("[GUARD] Recording was not started because the active-recording guard rejected it.")
+        return 0
+
+    try:
+        return await _ORIGINAL_MAIN_FUNCTION()
     finally:
-        if asset_dir:
-            try:
-                shutil.rmtree(asset_dir, ignore_errors=True)
-            except Exception:
-                pass
+        await _release_broadcast_slot()
 
 
-_ASSET_ORIGINAL_SEND_VIDEO_FILE = send_video_file
-send_video_file = _asset_send_video_file
-
-# ============================================================
-# AUTO MEDIA ASSETS FEATURE v2 - END
-# ============================================================
+main = _guarded_main
 
 # ============================================================
 # Entrypoint
