@@ -18,6 +18,7 @@ from playwright.async_api import async_playwright
 # ============================================================
 # Configuration
 # ============================================================
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -38,6 +39,7 @@ SEGMENT_TIMEOUT = 30
 # ✅ تحسين #1: تقليل ضغط GitHub API (من 2 إلى 30 ثانية)
 STOP_CHECK_INTERVAL = 30.0  # فحص إشارة الإيقاف كل 30 ثانية
 PLAYLIST_POLL_INTERVAL = 3.0  # فحص قائمة التشغيل كل 3 ثوانٍ
+
 MAX_PLAYLIST_RETRIES = 5
 MAX_SEGMENT_RETRIES = 3
 STATUS_UPDATE_INTERVAL = 60
@@ -46,6 +48,7 @@ STATUS_UPDATE_INTERVAL = 60
 SESSION_REFRESH_INTERVAL = 45 * 60  # 45 دقيقة
 
 STOP_FILE = f".recorder/stop/{RECORD_ID}"
+
 WORK_DIR = Path("recording_work")
 SEGMENTS_DIR = WORK_DIR / "segments"
 OUTPUT_DIR = WORK_DIR / "output"
@@ -56,6 +59,7 @@ stop_requested = False
 # ============================================================
 # Active recording guard configuration
 # ============================================================
+
 try:
     MAX_ACTIVE_RECORDINGS = int(os.environ.get("MAX_ACTIVE_RECORDINGS", "5"))
 except Exception:
@@ -71,7 +75,15 @@ try:
 except Exception:
     ADMISSION_LOCK_TTL_SECONDS = 120
 
-USER_LOCK_TTL_SECONDS = ACTIVE_STALE_SECONDS
+# الإصلاح: لا تعتبر الأقفال وملفات الحالة القديمة دليلاً على تسجيل نشط لثلاث ساعات.
+# التسجيل الحي يحدّث الحالة كل 60 ثانية تقريبًا، لذلك نستخدم نافذة أقصر بكثير.
+GUARD_HEARTBEAT_FRESH_SECONDS = max(180, int(STATUS_UPDATE_INTERVAL * 10))
+USER_LOCK_TTL_SECONDS = min(ACTIVE_STALE_SECONDS, GUARD_HEARTBEAT_FRESH_SECONDS)
+ACTIVE_STATUS_FRESH_SECONDS = USER_LOCK_TTL_SECONDS
+ACTIVE_START_GRACE_SECONDS = min(
+    ACTIVE_STALE_SECONDS,
+    max(GUARD_HEARTBEAT_FRESH_SECONDS, DISCOVERY_TIMEOUT + 60),
+)
 
 ACTIVE_DIR = ".recorder/active"
 STATUS_DIR = ".recorder/status"
@@ -82,12 +94,14 @@ ADMISSION_LOCK_FILE = f"{LOCK_DIR}/_admission.json"
 # ============================================================
 # Logging
 # ============================================================
+
 def log(message):
     print(message, flush=True)
 
 # ============================================================
 # Signal handling
 # ============================================================
+
 def request_stop(signum, frame):
     global stop_requested
     if not stop_requested:
@@ -100,6 +114,7 @@ signal.signal(signal.SIGINT, request_stop)
 # ============================================================
 # Telegram
 # ============================================================
+
 async def telegram_request(method, data=None, file_data=None, file_name=None):
     if not BOT_TOKEN:
         log("[TELEGRAM] BOT_TOKEN is missing.")
@@ -145,6 +160,7 @@ async def send_message(text):
 # ============================================================
 # GitHub State Management
 # ============================================================
+
 async def github_update_file(path, content_dict, message):
     if not GITHUB_TOKEN:
         return
@@ -216,6 +232,7 @@ async def github_delete_file(path, message):
 # ============================================================
 # GitHub stop signal
 # ============================================================
+
 async def github_stop_requested():
     if not GITHUB_TOKEN or not RECORD_ID:
         return False
@@ -235,7 +252,6 @@ async def github_stop_requested():
                 if response.status == 404:
                     return False
                 if response.status != 200:
-                    # لا نحتاج لتسجيل هذا بعد الآن (تقليل الـ noise)
                     return False
 
                 data = await response.json()
@@ -291,6 +307,7 @@ async def check_stop():
 # ============================================================
 # Helpers
 # ============================================================
+
 def normalize_url(url):
     if not url:
         return None
@@ -316,11 +333,13 @@ def origin_from_url(url):
 # ============================================================
 # BASE_NAME defined AFTER safe_filename
 # ============================================================
+
 BASE_NAME = safe_filename(TARGET_USERNAME) if TARGET_USERNAME else safe_filename(RECORD_ID)
 
 # ============================================================
 # Browser session headers
 # ============================================================
+
 async def build_browser_session(page, context):
     user_agent = await page.evaluate("() => navigator.userAgent")
     cookies = await context.cookies()
@@ -344,10 +363,11 @@ async def build_browser_session(page, context):
 # ============================================================
 # HLS discovery
 # ============================================================
+
 async def inspect_page_for_hls(page, discovered):
     try:
         html = await page.content()
-        found = re.findall(r'https?://[^"\'\s]+?\.m3u8[^"\'\s]*', html, flags=re.IGNORECASE)
+        found = re.findall(r'https?://[^"\s]+?\.m3u8[^"\s]*', html, flags=re.IGNORECASE)
         for url in found:
             url = url.replace("&amp;", "&")
             if url not in discovered:
@@ -357,9 +377,11 @@ async def inspect_page_for_hls(page, discovered):
         log(f"[HLS] HTML inspection failed: {exc}")
 
     try:
-        performance_urls = await page.evaluate("""
+        performance_urls = await page.evaluate(
+            """
             () => performance.getEntriesByType('resource').map(e => e.name).filter(n => n.includes('.m3u8'))
-        """)
+            """
+        )
         for url in performance_urls:
             if url not in discovered:
                 discovered.append(url)
@@ -370,6 +392,7 @@ async def inspect_page_for_hls(page, discovered):
 # ============================================================
 # Playlist parsing
 # ============================================================
+
 def parse_playlist(text, playlist_url):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
@@ -413,6 +436,7 @@ def parse_playlist(text, playlist_url):
 # ============================================================
 # Browser HLS request
 # ============================================================
+
 async def browser_get_playlist(context, url):
     log(f"[PLAYLIST] Browser GET: {url}")
     try:
@@ -440,6 +464,7 @@ async def browser_get_playlist(context, url):
 # ============================================================
 # Find live media playlist (with quality logging)
 # ============================================================
+
 async def find_live_playlist(context, discovered):
     checked = set()
     candidates = list(discovered)
@@ -462,10 +487,8 @@ async def find_live_playlist(context, discovered):
 
         if parsed["type"] == "master":
             variants = parsed["variants"]
-            # ✅ Sort by bandwidth descending (highest quality first)
             variants.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
 
-            # ✅ NEW: Log all available qualities
             log(f"[HLS] Master playlist contains {len(variants)} variants:")
             for i, v in enumerate(variants, 1):
                 resolution = v.get("resolution", "unknown")
@@ -499,6 +522,7 @@ async def find_live_playlist(context, discovered):
 # ============================================================
 # Segment downloader
 # ============================================================
+
 async def download_segment(session, url, path, headers):
     try:
         timeout = aiohttp.ClientTimeout(total=SEGMENT_TIMEOUT)
@@ -522,6 +546,7 @@ async def download_segment(session, url, path, headers):
 # ============================================================
 # Recording loop (مع تحسين Session Refresh)
 # ============================================================
+
 async def record_hls(playwright, context, page, playlist_url, initial_playlist, headers):
     """
     ✅ تحسين #3: Session Refresh كل 45 دقيقة لمنع Memory Leak
@@ -533,6 +558,7 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
 
     downloaded = set()
     segment_files = []
+
     initial_segments = initial_playlist.get("segments", [])
     log(f"[RECORDER] Initial segments: {len(initial_segments)}")
 
@@ -542,17 +568,21 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
     consecutive_playlist_errors = 0
     consecutive_segment_errors = 0
     last_status_update = 0
-    last_session_refresh = time.time()  # ✅ جديد: تتبع وقت آخر refresh
+    last_session_refresh = time.time()
     recording_start_time = time.time()
     start_time_iso = datetime.now(timezone.utc).isoformat()
 
     await github_update_file(
         f".recorder/active/{RECORD_ID}.json",
-        {"record_id": RECORD_ID, "url": PAGE_URL, "username": TARGET_USERNAME, "started_at": start_time_iso},
+        {
+            "record_id": RECORD_ID,
+            "url": PAGE_URL,
+            "username": TARGET_USERNAME,
+            "started_at": start_time_iso,
+        },
         f"Start recording {RECORD_ID}"
     )
 
-    # ✅ جديد: متغير للتحكم في فحص الإيقاف كل 30 ثانية
     stop_check_counter = 0
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -595,37 +625,30 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
             if time.time() - last_session_refresh > SESSION_REFRESH_INTERVAL:
                 log(f"[SESSION] 🔄 Refreshing browser session ({SESSION_REFRESH_INTERVAL // 60}min passed)...")
                 try:
-                    # إغلاق المتصفح القديم
                     try:
                         await context.close()
                     except Exception:
                         pass
 
-                    # فتح context جديد
                     context = await playwright.chromium.new_context(
                         viewport={"width": 1280, "height": 720},
                         user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
                     )
                     page = await context.new_page()
 
-                    # إعادة ربط الـ response handler
                     async def handle_response(response):
-                        # لا نحتاج لعمل شيء هنا، فقط للحفاظ على الاتصال
                         pass
 
                     page.on("response", handle_response)
 
-                    # إعادة فتح الصفحة
                     try:
                         await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
                         last_session_refresh = time.time()
                         log("[SESSION] ✅ Session refreshed successfully")
                     except Exception as goto_exc:
                         log(f"[SESSION] ⚠️ Could not reload page: {goto_exc}")
-                        # الاستمرار بالـ session الجديد حتى لو فشل إعادة التحميل
                 except Exception as exc:
                     log(f"[SESSION] ⚠️ Refresh failed: {exc}")
-                    # الاستمرار بالـ session القديم كـ fallback
 
             try:
                 current_headers = await build_browser_session(page, context)
@@ -676,6 +699,7 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
 
             segments = parsed.get("segments", [])
             new_segments = [url for url in segments if url not in downloaded]
+
             if new_segments:
                 log(f"[RECORDER] New segments: {len(new_segments)}")
 
@@ -727,6 +751,7 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
 # ============================================================
 # MP4 muxing (مع تحسين FFmpeg للبث الطويل)
 # ============================================================
+
 def create_concat_file(segment_files, filename="segments.txt"):
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     concat_file = WORK_DIR / filename
@@ -747,16 +772,17 @@ def mux_segments(segment_files):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     concat_file = create_concat_file(segment_files)
     output_file = OUTPUT_DIR / f"{BASE_NAME}.mp4"
+
     log(f"[MUX] Creating MP4: {output_file}")
 
     # ✅ تحسين #2: FFmpeg flags للبثوث الطويلة
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-        "-fflags", "+discardcorrupt+genpts",  # ✅ جديد: إصلاح timestamps التالفة
+        "-fflags", "+discardcorrupt+genpts",
         "-f", "concat", "-safe", "0", "-i", str(concat_file),
         "-c", "copy",
         "-movflags", "+faststart",
-        "-avoid_negative_ts", "make_zero",  # ✅ جديد: منع timestamps سالبة
+        "-avoid_negative_ts", "make_zero",
         str(output_file),
     ]
 
@@ -781,6 +807,7 @@ def mux_segments(segment_files):
 # ============================================================
 # Split large MP4 into valid MP4 video parts
 # ============================================================
+
 def mux_part(segment_files, part_number):
     if not segment_files:
         return None
@@ -923,6 +950,7 @@ def split_recording_into_parts(segment_files):
         right = group[middle:]
 
         log(f"[PARTS] Part {part_number_hint} is too large ({size_mb:.2f} MB). Splitting {len(group)} segments into {len(left)} + {len(right)}.")
+
         verify_group(left, part_number_hint)
         next_hint = len(verified_groups) + 1
         verify_group(right, next_hint)
@@ -946,7 +974,6 @@ def split_recording_into_parts(segment_files):
 
     for index, (old_file, size) in enumerate(verified_groups, start=1):
         final_name = PARTS_DIR / f"{BASE_NAME}_part_{index:03d}.mp4"
-
         try:
             if old_file != final_name:
                 if final_name.exists():
@@ -974,6 +1001,7 @@ def split_recording_into_parts(segment_files):
 # ============================================================
 # Telegram upload
 # ============================================================
+
 async def send_video_file(file_path, part_number=None, total_parts=None):
     if not file_path or not file_path.exists():
         log(f"[TELEGRAM] Output file does not exist: {file_path}")
@@ -1001,7 +1029,6 @@ async def send_video_file(file_path, part_number=None, total_parts=None):
     for attempt in range(MAX_UPLOAD_RETRIES):
         try:
             log(f"[TELEGRAM] Uploading video (attempt {attempt+1}): {file_path.name}")
-
             with file_path.open("rb") as file:
                 result = await telegram_request(
                     "sendVideo",
@@ -1036,7 +1063,6 @@ async def send_recording(output_file, segment_files, duration_seconds):
     full_size_mb = output_file.stat().st_size / 1024 / 1024
     log(f"[TELEGRAM] Final MP4 size: {full_size_mb:.2f} MB")
 
-    # ✅ جديد: تنسيق المدة بشكل أفضل
     duration_mins = duration_seconds // 60
     duration_hours = duration_mins // 60
     duration_mins_remaining = duration_mins % 60
@@ -1047,7 +1073,6 @@ async def send_recording(output_file, segment_files, duration_seconds):
         duration_str = f"{duration_mins}m"
 
     if full_size_mb < TELEGRAM_MAX_MB:
-        # ✅ تحسين #4: رسالة مفصلة
         await send_message(
             f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
             f"👤 {TARGET_USERNAME}\n"
@@ -1060,7 +1085,6 @@ async def send_recording(output_file, segment_files, duration_seconds):
         uploaded = await send_video_file(output_file)
         return uploaded
 
-    # ✅ تحسين #4: رسالة مفصلة للتسجيلات الكبيرة
     await send_message(
         f"🎬 اكتمل التسجيل #{RECORD_ID}\n"
         f"👤 {TARGET_USERNAME}\n"
@@ -1107,6 +1131,7 @@ async def send_recording(output_file, segment_files, duration_seconds):
 # ============================================================
 # Main
 # ============================================================
+
 async def main():
     if not PAGE_URL:
         print('Usage: python record_once.py "https://example.com/stream/..."')
@@ -1156,10 +1181,13 @@ async def main():
         while time.time() - discovery_started < DISCOVERY_TIMEOUT:
             if await check_stop():
                 break
+
             await inspect_page_for_hls(page, discovered)
+
             if discovered:
                 if time.time() - discovery_started > 5:
                     break
+
             await asyncio.sleep(1)
 
         await inspect_page_for_hls(page, discovered)
@@ -1181,6 +1209,7 @@ async def main():
         log(f"[HLS] Total discovered URLs: {len(discovered)}")
 
         playlist_url, playlist = await find_live_playlist(context, discovered)
+
         if not playlist_url or not playlist:
             if await check_stop():
                 await browser.close()
@@ -1195,9 +1224,9 @@ async def main():
             return 1
 
         log(f"[HLS] Recording playlist: {playlist_url}")
+
         headers = await build_browser_session(page, context)
 
-        # ✅ تغيير: تمرير playwright بدلاً من context فقط (للـ session refresh)
         segment_files, start_time_iso, recording_start_time = await record_hls(
             playwright, context, page, playlist_url, playlist, headers
         )
@@ -1215,6 +1244,7 @@ async def main():
             await send_message(f"⏹️ تم إيقاف التسجيل #{RECORD_ID}، لكن لم يتم تسجيل أي مقطع.")
         else:
             await send_message("❌ لم يتم تسجيل أي جزء من البث.")
+
         await github_delete_file(f".recorder/active/{RECORD_ID}.json", f"Remove active {RECORD_ID}")
         await github_delete_file(f".recorder/status/{RECORD_ID}.json", f"Remove status {RECORD_ID}")
         return 0
@@ -1227,8 +1257,6 @@ async def main():
         return 1
 
     duration = int(time.time() - recording_start_time)
-
-    # ✅ تغيير: تمرير duration إلى send_recording
     uploaded = await send_recording(output_file, segment_files, duration)
 
     full_size_mb = output_file.stat().st_size / 1024 / 1024 if output_file and output_file.exists() else 0
@@ -1274,6 +1302,7 @@ async def main():
 # ============================================================
 # One high-quality contact sheet per full broadcast
 # ============================================================
+
 _BROADCAST_CONTACT_FRAME_COUNT = 12
 _BROADCAST_CONTACT_COLS = 4
 _BROADCAST_CONTACT_MAX_BYTES = int(9 * 1024 * 1024)
@@ -1285,7 +1314,6 @@ _BROADCAST_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
 ]
-
 
 def _broadcast_run_command(command, timeout=_BROADCAST_FFMPEG_TIMEOUT, log_error=True):
     try:
@@ -1302,7 +1330,6 @@ def _broadcast_run_command(command, timeout=_BROADCAST_FFMPEG_TIMEOUT, log_error
         log(f"[CONTACT] Command exception: {exc}")
         return None
 
-
 def _broadcast_find_font():
     for candidate in _BROADCAST_FONT_CANDIDATES:
         try:
@@ -1311,7 +1338,6 @@ def _broadcast_find_font():
         except Exception:
             pass
     return None
-
 
 def _broadcast_drawtext_filter(text, font_path):
     safe_text = str(text).replace(":", r"\:")
@@ -1328,7 +1354,6 @@ def _broadcast_drawtext_filter(text, font_path):
     ])
     return "drawtext=" + ":".join(options)
 
-
 def _broadcast_format_timestamp(seconds):
     try:
         total = int(max(0, float(seconds)))
@@ -1342,7 +1367,6 @@ def _broadcast_format_timestamp(seconds):
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
-
 
 def _broadcast_duration_text(seconds):
     try:
@@ -1360,14 +1384,15 @@ def _broadcast_duration_text(seconds):
         return f"{minutes}m"
     return f"{secs}s"
 
-
 def _broadcast_get_duration_seconds(file_path, fallback_duration=0.0):
     probe_cmd = [
-        "ffprobe", "-v", "error",
+        "ffprobe",
+        "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(file_path),
     ]
+
     result = _broadcast_run_command(probe_cmd, timeout=60, log_error=False)
     if result is not None and result.returncode == 0:
         try:
@@ -1400,7 +1425,6 @@ def _broadcast_get_duration_seconds(file_path, fallback_duration=0.0):
         pass
 
     return 0.0
-
 
 def _broadcast_extract_frame(video_path, target_seconds, duration_seconds, frame_path, label, font_path, use_label):
     try:
@@ -1438,6 +1462,7 @@ def _broadcast_extract_frame(video_path, target_seconds, duration_seconds, frame
             pass
 
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+
         if seek_pos > 0:
             cmd += ["-ss", f"{seek_pos:.3f}"]
         if window_size > 0:
@@ -1456,10 +1481,10 @@ def _broadcast_extract_frame(video_path, target_seconds, duration_seconds, frame
 
     return False
 
-
 def _broadcast_compress_image(image_path, max_bytes):
     if not image_path or not image_path.exists():
         return False
+
     if image_path.stat().st_size <= max_bytes:
         return True
 
@@ -1507,7 +1532,6 @@ def _broadcast_compress_image(image_path, max_bytes):
                 pass
 
     return image_path.exists() and image_path.stat().st_size <= max_bytes
-
 
 def _broadcast_generate_contact_sheet(video_path, fallback_duration=0.0):
     work_dir = None
@@ -1638,10 +1662,10 @@ def _broadcast_generate_contact_sheet(video_path, fallback_duration=0.0):
         log(f"[CONTACT] Contact sheet generation failed: {exc}")
         return None, work_dir, fallback_duration, 0
 
-
 async def _broadcast_send_photo(file_path, caption):
     if not BOT_TOKEN or not ADMIN_USER_ID:
         return False
+
     if not file_path or not Path(file_path).exists():
         return False
 
@@ -1691,9 +1715,7 @@ async def _broadcast_send_photo(file_path, caption):
 
     return False
 
-
 _BROADCAST_ORIGINAL_SEND_RECORDING = send_recording
-
 
 async def _broadcast_send_recording(output_file, segment_files, duration_seconds):
     uploaded = await _BROADCAST_ORIGINAL_SEND_RECORDING(output_file, segment_files, duration_seconds)
@@ -1743,12 +1765,12 @@ async def _broadcast_send_recording(output_file, segment_files, duration_seconds
 
     return uploaded
 
-
 send_recording = _broadcast_send_recording
 
 # ============================================================
 # Active recording guard helpers
 # ============================================================
+
 def _guard_normalize_identity(value):
     if not value:
         return ""
@@ -1756,17 +1778,14 @@ def _guard_normalize_identity(value):
     value = re.sub(r"\s+", "", value)
     return value
 
-
 def _guard_identity_key():
     identity = _guard_normalize_identity(TARGET_USERNAME)
     if not identity:
         identity = _guard_normalize_identity(RECORD_ID)
     return safe_filename(identity or "unknown")
 
-
 def _guard_user_lock_path(identity):
     return f"{USER_LOCK_DIR}/{identity}.json"
-
 
 def _guard_parse_iso_datetime(value):
     if not value:
@@ -1779,14 +1798,12 @@ def _guard_parse_iso_datetime(value):
     except Exception:
         return None
 
-
 def _guard_age_seconds(value):
     dt = _guard_parse_iso_datetime(value)
     if not dt:
         return None
     age = (datetime.now(timezone.utc) - dt).total_seconds()
     return max(0.0, age)
-
 
 async def _guard_github_api_request(method, path, body=None, timeout=20):
     if not GITHUB_TOKEN:
@@ -1816,26 +1833,20 @@ async def _guard_github_api_request(method, path, body=None, timeout=20):
         log(f"[GUARD] GitHub API {method} {path} failed: {exc}")
         return None, None
 
-
 async def _guard_get_file(path):
     status, data = await _guard_github_api_request("GET", path)
-
     if status == 200 and isinstance(data, dict):
         sha = data.get("sha")
         encoded = data.get("content")
         obj = None
-
         if encoded:
             try:
                 raw = base64.b64decode(encoded.replace("\n", "")).decode("utf-8", errors="replace")
                 obj = json.loads(raw)
             except Exception as exc:
                 log(f"[GUARD] Could not decode {path}: {exc}")
-
         return status, obj, sha
-
     return status, None, None
-
 
 async def _guard_list_dir(path):
     status, data = await _guard_github_api_request("GET", path)
@@ -1846,7 +1857,6 @@ async def _guard_list_dir(path):
                 names.append(str(item.get("name")))
         return names
     return []
-
 
 async def _guard_put_json(path, obj, message, sha=None):
     try:
@@ -1871,7 +1881,6 @@ async def _guard_put_json(path, obj, message, sha=None):
     log(f"[GUARD] PUT failed for {path}: HTTP {status}")
     return False, None
 
-
 async def _guard_delete_file(path, message, sha=None):
     if not sha:
         status, _, sha = await _guard_get_file(path)
@@ -1881,7 +1890,6 @@ async def _guard_delete_file(path, message, sha=None):
     body = {"message": message, "sha": sha}
     status, _ = await _guard_github_api_request("DELETE", path, body)
     return status in (200, 204)
-
 
 async def _guard_acquire_admission_lock(timeout_seconds=120):
     if not GITHUB_TOKEN:
@@ -1910,6 +1918,7 @@ async def _guard_acquire_admission_lock(timeout_seconds=120):
             )
             if ok:
                 return True
+
         elif status == 200:
             owner = obj.get("owner") if isinstance(obj, dict) else None
             age = _guard_age_seconds(obj.get("acquired_at")) if isinstance(obj, dict) else None
@@ -1932,7 +1941,6 @@ async def _guard_acquire_admission_lock(timeout_seconds=120):
 
     return False
 
-
 async def _guard_release_admission_lock():
     if not GITHUB_TOKEN:
         return
@@ -1951,35 +1959,79 @@ async def _guard_release_admission_lock():
     except Exception as exc:
         log(f"[GUARD] Could not release admission lock: {exc}")
 
-
 async def _guard_is_record_active(record_id, active_obj):
+    """
+    الإصلاح الجوهري:
+    لا يعتبر أي ملف حالة قديم دليلاً كافياً على تسجيل نشط.
+    الحالة النشطة يجب أن تكون مدعومة بواحد مما يلي:
+    1. ملف status حديث.
+    2. ملف active داخل فترة سماح البداية فقط.
+    3. قفل مستخدم حديث مرتبط فعلياً بملف نشط/حالة قابلة للتحقق.
+    """
     if not record_id:
         return False
 
     try:
         status_status, status_obj, _ = await _guard_get_file(f"{STATUS_DIR}/{record_id}.json")
-        if isinstance(status_obj, dict):
+
+        # إذا تعذر التحقق من الحالة، نتصرف بتحفظ ولا نعتبر التسجيل ميتاً.
+        if status_status is None or (status_status not in (200, 404)):
+            return True
+
+        if status_status == 200:
+            if not isinstance(status_obj, dict):
+                return True
+
             age = _guard_age_seconds(status_obj.get("updated_at") or status_obj.get("timestamp"))
-            if age is not None and age < ACTIVE_STALE_SECONDS:
+            if age is not None and age < ACTIVE_STATUS_FRESH_SECONDS:
                 return True
 
-        if isinstance(active_obj, dict):
-            age = _guard_age_seconds(active_obj.get("updated_at") or active_obj.get("started_at"))
-            if age is not None and age < ACTIVE_STALE_SECONDS:
+        if not isinstance(active_obj, dict):
+            active_status, fetched_active_obj, _ = await _guard_get_file(f"{ACTIVE_DIR}/{record_id}.json")
+
+            if active_status is None or (active_status not in (200, 404)):
                 return True
 
-            identity = _guard_normalize_identity(active_obj.get("username") or active_obj.get("identity"))
-            if identity:
-                lock_status, lock_obj, _ = await _guard_get_file(_guard_user_lock_path(identity))
-                if isinstance(lock_obj, dict) and str(lock_obj.get("record_id", "")) == str(record_id):
-                    lock_age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
-                    if lock_age is None or lock_age < USER_LOCK_TTL_SECONDS:
-                        return True
+            if active_status == 404:
+                return False
+
+            if not isinstance(fetched_active_obj, dict):
+                return True
+
+            active_obj = fetched_active_obj
+
+        updated_age = _guard_age_seconds(active_obj.get("updated_at"))
+        if updated_age is not None and updated_age < ACTIVE_STATUS_FRESH_SECONDS:
+            return True
+
+        started_age = _guard_age_seconds(active_obj.get("started_at"))
+        if started_age is not None and started_age < ACTIVE_START_GRACE_SECONDS:
+            return True
+
+        identity = _guard_normalize_identity(
+            active_obj.get("username") or active_obj.get("identity") or record_id
+        )
+
+        if identity:
+            lock_status, lock_obj, _ = await _guard_get_file(_guard_user_lock_path(identity))
+
+            if lock_status is None or (lock_status not in (200, 404)):
+                return True
+
+            if (
+                lock_status == 200
+                and isinstance(lock_obj, dict)
+                and str(lock_obj.get("record_id", "")) == str(record_id)
+            ):
+                lock_age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
+                if lock_age is not None and lock_age < USER_LOCK_TTL_SECONDS:
+                    return True
+
+        return False
+
     except Exception as exc:
         log(f"[GUARD] Active check failed for {record_id}: {exc}")
-
-    return False
-
+        return True
 
 async def _guard_cleanup_stale_states():
     if not GITHUB_TOKEN:
@@ -1999,6 +2051,7 @@ async def _guard_cleanup_stale_states():
 
             active_path = f"{ACTIVE_DIR}/{name}"
             status, active_obj, _ = await _guard_get_file(active_path)
+
             if status != 200:
                 continue
 
@@ -2014,29 +2067,37 @@ async def _guard_cleanup_stale_states():
             log(f"[GUARD] Removed stale active records: {', '.join(removed_active)}")
 
         lock_names = await _guard_list_dir(USER_LOCK_DIR)
+
         for name in lock_names:
             if not name.endswith(".json"):
                 continue
 
             lock_path = f"{USER_LOCK_DIR}/{name}"
             status, lock_obj, sha = await _guard_get_file(lock_path)
+
             if status != 200 or not isinstance(lock_obj, dict):
                 continue
 
             record_id = str(lock_obj.get("record_id", ""))
             age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
-            if age is None or age <= USER_LOCK_TTL_SECONDS:
+
+            if not record_id:
+                if age is not None and age > USER_LOCK_TTL_SECONDS:
+                    log(f"[GUARD] Removing stale orphan user lock: {name}")
+                    await _guard_delete_file(lock_path, f"Remove stale orphan user lock {name}", sha=sha)
                 continue
 
-            active_status, active_obj, _ = await _guard_get_file(f"{ACTIVE_DIR}/{record_id}.json") if record_id else (404, None, None)
-            if active_status == 200 and await _guard_is_record_active(record_id, active_obj):
+            if record_id == RECORD_ID:
+                continue
+
+            if await _guard_is_record_active(record_id, None):
                 continue
 
             log(f"[GUARD] Removing stale user lock: {name} ({record_id})")
             await _guard_delete_file(lock_path, f"Remove stale user lock {name}", sha=sha)
+
     except Exception as exc:
         log(f"[GUARD] Stale cleanup failed: {exc}")
-
 
 async def _guard_find_duplicate_identity(identity):
     if not identity:
@@ -2046,14 +2107,19 @@ async def _guard_find_duplicate_identity(identity):
         lock_path = _guard_user_lock_path(identity)
         status, lock_obj, _ = await _guard_get_file(lock_path)
 
+        if status is None or (status not in (200, 404)):
+            return "unknown"
+
         if status == 200 and isinstance(lock_obj, dict):
             record_id = str(lock_obj.get("record_id", ""))
             if record_id and record_id != RECORD_ID:
                 age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
                 if age is None or age < USER_LOCK_TTL_SECONDS:
-                    return record_id
+                    if await _guard_is_record_active(record_id, None):
+                        return record_id
 
         active_names = await _guard_list_dir(ACTIVE_DIR)
+
         for name in active_names:
             if not name.endswith(".json"):
                 continue
@@ -2063,26 +2129,34 @@ async def _guard_find_duplicate_identity(identity):
                 continue
 
             status, active_obj, _ = await _guard_get_file(f"{ACTIVE_DIR}/{name}")
+
+            if status is None or (status not in (200, 404)):
+                return "unknown"
+
             if status != 200 or not isinstance(active_obj, dict):
                 continue
 
-            other_identity = _guard_normalize_identity(active_obj.get("username") or active_obj.get("identity"))
+            other_identity = _guard_normalize_identity(
+                active_obj.get("username") or active_obj.get("identity") or record_id
+            )
+
             if other_identity != identity:
                 continue
 
             if await _guard_is_record_active(record_id, active_obj):
                 return record_id
+
     except Exception as exc:
         log(f"[GUARD] Duplicate identity check failed: {exc}")
 
     return None
-
 
 async def _guard_count_active_records():
     active_ids = set()
 
     try:
         active_names = await _guard_list_dir(ACTIVE_DIR)
+
         for name in active_names:
             if not name.endswith(".json"):
                 continue
@@ -2092,33 +2166,42 @@ async def _guard_count_active_records():
                 continue
 
             status, active_obj, _ = await _guard_get_file(f"{ACTIVE_DIR}/{name}")
-            if status != 200:
-                continue
 
-            if await _guard_is_record_active(record_id, active_obj):
+            if status == 200:
+                if await _guard_is_record_active(record_id, active_obj):
+                    active_ids.add(record_id)
+            elif status != 404:
+                # إذا تعذر التحقق من ملف الحالة، نحسبه بحذر لتجاوز الحد الآمن.
                 active_ids.add(record_id)
 
         lock_names = await _guard_list_dir(USER_LOCK_DIR)
+
         for name in lock_names:
             if not name.endswith(".json"):
                 continue
 
             status, lock_obj, _ = await _guard_get_file(f"{USER_LOCK_DIR}/{name}")
-            if status != 200 or not isinstance(lock_obj, dict):
-                continue
 
-            record_id = str(lock_obj.get("record_id", ""))
-            if not record_id or record_id == RECORD_ID:
-                continue
+            if status == 200 and isinstance(lock_obj, dict):
+                record_id = str(lock_obj.get("record_id", ""))
+                if not record_id or record_id == RECORD_ID:
+                    continue
 
-            age = _guard_age_seconds(lock_obj.get("updated_at") or lock_obj.get("started_at"))
-            if age is None or age < USER_LOCK_TTL_SECONDS:
-                active_ids.add(record_id)
+                if record_id in active_ids:
+                    continue
+
+                # الإصلاح: لا نعد قفل المستخدم وحده دليلاً على تسجيل نشط.
+                if await _guard_is_record_active(record_id, None):
+                    active_ids.add(record_id)
+
+            elif status != 404:
+                # إذا تعذر التحقق من القفل، نحسبه بحذر.
+                active_ids.add(f"unknown-lock:{name}")
+
     except Exception as exc:
         log(f"[GUARD] Active count failed: {exc}")
 
     return len(active_ids)
-
 
 async def _guard_acquire_user_lock(identity):
     lock_path = _guard_user_lock_path(identity)
@@ -2141,10 +2224,12 @@ async def _guard_acquire_user_lock(identity):
         existing_record_id = str(existing_obj.get("record_id", "")) if isinstance(existing_obj, dict) else ""
         age = _guard_age_seconds(existing_obj.get("updated_at") or existing_obj.get("started_at")) if isinstance(existing_obj, dict) else None
 
-        if existing_record_id and existing_record_id != RECORD_ID and (age is None or age < USER_LOCK_TTL_SECONDS):
-            return False, existing_record_id, existing_sha
+        if existing_record_id and existing_record_id != RECORD_ID:
+            if age is None or age < USER_LOCK_TTL_SECONDS:
+                if await _guard_is_record_active(existing_record_id, None):
+                    return False, existing_record_id, existing_sha
 
-        if isinstance(existing_obj, dict):
+        if isinstance(existing_obj, dict) and existing_record_id == RECORD_ID:
             payload["started_at"] = existing_obj.get("started_at") or now_iso
 
         ok, new_sha = await _guard_put_json(
@@ -2155,6 +2240,7 @@ async def _guard_acquire_user_lock(identity):
         )
         if ok:
             return True, None, new_sha
+
         return False, "update_failed", new_sha
 
     if status == 404:
@@ -2165,10 +2251,10 @@ async def _guard_acquire_user_lock(identity):
         )
         if ok:
             return True, None, new_sha
+
         return False, "create_failed_or_conflict", None
 
     return False, f"github_status_{status}", None
-
 
 async def _guard_touch_user_lock():
     if not GITHUB_TOKEN:
@@ -2184,6 +2270,7 @@ async def _guard_touch_user_lock():
         obj["updated_at"] = now_iso
         obj["identity"] = identity
         obj["username"] = TARGET_USERNAME
+
         await _guard_put_json(
             lock_path,
             obj,
@@ -2203,12 +2290,12 @@ async def _guard_touch_user_lock():
             "pid": os.getpid(),
             "max_active_recordings": MAX_ACTIVE_RECORDINGS,
         }
+
         await _guard_put_json(
             lock_path,
             payload,
             f"Restore user lock {identity} for {RECORD_ID}",
         )
-
 
 async def _guard_release_user_lock():
     if not GITHUB_TOKEN:
@@ -2218,11 +2305,11 @@ async def _guard_release_user_lock():
     lock_path = _guard_user_lock_path(identity)
 
     status, obj, sha = await _guard_get_file(lock_path)
+
     if status == 200 and sha and isinstance(obj, dict):
         record_id = str(obj.get("record_id", ""))
         if record_id == RECORD_ID:
             await _guard_delete_file(lock_path, f"Release user lock {identity} {RECORD_ID}", sha=sha)
-
 
 async def _guard_reserve_active_file(identity):
     active_path = f"{ACTIVE_DIR}/{RECORD_ID}.json"
@@ -2240,6 +2327,7 @@ async def _guard_reserve_active_file(identity):
     }
 
     status, existing_obj, existing_sha = await _guard_get_file(active_path)
+
     if status == 200 and isinstance(existing_obj, dict):
         payload["started_at"] = existing_obj.get("started_at") or now_iso
 
@@ -2249,8 +2337,8 @@ async def _guard_reserve_active_file(identity):
         f"Reserve active slot {RECORD_ID}",
         sha=existing_sha if status == 200 else None,
     )
-    return ok
 
+    return ok
 
 async def _acquire_broadcast_slot():
     if not GITHUB_TOKEN:
@@ -2294,12 +2382,13 @@ async def _acquire_broadcast_slot():
 
             log(f"[GUARD] Slot acquired: {active_count + 1}/{MAX_ACTIVE_RECORDINGS} active, identity='{identity}', record=#{RECORD_ID}.")
             return True
+
         finally:
             await _guard_release_admission_lock()
+
     except Exception as exc:
         log(f"[GUARD] Slot acquisition failed: {exc}")
         return False
-
 
 async def _release_broadcast_slot():
     try:
@@ -2317,9 +2406,7 @@ async def _release_broadcast_slot():
     except Exception as exc:
         log(f"[GUARD] Could not remove guarded status file: {exc}")
 
-
 _ORIGINAL_GITHUB_UPDATE_FILE = github_update_file
-
 
 async def _guarded_github_update_file(path, content_dict, message):
     is_status_update = (path == f"{STATUS_DIR}/{RECORD_ID}.json")
@@ -2339,11 +2426,9 @@ async def _guarded_github_update_file(path, content_dict, message):
 
     return result
 
-
 github_update_file = _guarded_github_update_file
 
 _ORIGINAL_MAIN_FUNCTION = main
-
 
 async def _guarded_main():
     allowed = await _acquire_broadcast_slot()
@@ -2356,12 +2441,12 @@ async def _guarded_main():
     finally:
         await _release_broadcast_slot()
 
-
 main = _guarded_main
 
 # ============================================================
 # Entrypoint
 # ============================================================
+
 if __name__ == "__main__":
     try:
         exit_code = asyncio.run(main())
@@ -2370,7 +2455,7 @@ if __name__ == "__main__":
         log("[STOP] Keyboard interrupt.")
         sys.exit(0)
     except Exception as exc:
-        log(f"[FATAL] {type(exc).name}: {exc}")
+        log(f"[FATAL] {type(exc).__name__}: {exc}")
         try:
             asyncio.run(send_message("❌ حدث خطأ غير متوقع أثناء التسجيل."))
         except Exception:
