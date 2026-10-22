@@ -4,7 +4,7 @@
 # - Check every non-active watchlist user.
 # - Classify every checked user before starting recordings.
 # - Never let the recording limit stop result classification.
-# - Keep total active recordings <= 5 from this monitor's point of view.
+# - Keep total active recordings <= 10 from this monitor's point of view.
 # - Treat m3u8 as evidence of a live stream, but let the Tango API
 #   override it when the API explicitly identifies Premium.
 # - Handle boolean Premium fields correctly.
@@ -14,6 +14,8 @@ import asyncio
 import base64
 import json
 import os
+import random
+import string
 import sys
 import time
 from datetime import datetime, timezone
@@ -41,8 +43,8 @@ WATCHLIST_PATH = ".recorder/config/watchlist.json"
 # This is NOT the recording limit.
 MAX_CONCURRENT_USERS = 5
 
-# Maximum total active recordings allowed.
-MAX_TOTAL_RECORDINGS = 5
+# ✅ تحديث: رفع الحد الأقصى ليتطابق مع record_once.py
+MAX_TOTAL_RECORDINGS = 10
 
 # Maximum time spent waiting for stream/API evidence per user.
 MAX_WAIT_SECONDS = 8.0
@@ -513,9 +515,6 @@ async def github_get_active_usernames():
 # ============================================================
 
 def generate_record_id():
-    import random
-    import string
-
     chars = string.ascii_uppercase + string.digits
 
     return "".join(
@@ -630,14 +629,6 @@ PREMIUM_KEYWORDS = {
 def value_indicates_premium(value):
     """
     Safely interpret common Premium representations.
-
-    Important:
-    - True => Premium
-    - "true" => Premium
-    - strings such as "premium", "paid", "vip" => Premium
-    - False => NOT Premium
-    - "false" => NOT Premium
-    - None / empty => unknown
     """
 
     if value is None:
@@ -691,13 +682,6 @@ def is_premium_stream(stream_data, details_data):
     """
     Return True only when the supplied stream/details data
     contains an explicit Premium-like indicator.
-
-    We intentionally do NOT classify:
-        stream exists + missing URL
-    as Premium by itself.
-
-    Missing data must not be converted into a false Premium
-    assertion without evidence.
     """
 
     if isinstance(stream_data, dict):
@@ -766,28 +750,15 @@ async def check_user_live_status(browser, username):
         "status": StreamStatus.OFFLINE,
         "stream_url": None,
         "stream_id": None,
-
-        # m3u8 is evidence of a live stream, but it is not
-        # allowed to permanently override a later Premium API result.
         "m3u8_seen": False,
-
-        # Whether Tango's watch API returned a stream object.
         "api_stream_seen": False,
-
-        # Whether the API explicitly classified the stream as Premium.
         "api_premium": False,
-
-        # Whether the API explicitly classified the stream as normal.
         "api_normal": False,
     }
 
     async def handle_response(response):
         try:
             url = response.url
-
-            # ----------------------------------------------------
-            # Tango watch API
-            # ----------------------------------------------------
 
             if (
                 "proxycador/api/public/v1/live/stream/v2/watch"
@@ -819,8 +790,6 @@ async def check_user_live_status(browser, username):
                         stream_info["api_stream_seen"] = True
                         stream_info["stream_id"] = stream.get("id")
 
-                        # Premium has priority over every other
-                        # stream signal.
                         if is_premium_stream(
                             stream,
                             details,
@@ -839,8 +808,6 @@ async def check_user_live_status(browser, username):
                         else:
                             stream_info["api_normal"] = True
 
-                            # Only classify as normal here if
-                            # Premium was not explicitly detected.
                             if not stream_info["api_premium"]:
                                 stream_info["status"] = (
                                     StreamStatus.LIVE_NORMAL
@@ -860,10 +827,6 @@ async def check_user_live_status(browser, username):
                             f"Watch API parse error: {exc}"
                         )
 
-            # ----------------------------------------------------
-            # HLS m3u8
-            # ----------------------------------------------------
-
             if ".m3u8" in url.lower():
 
                 stream_info["m3u8_seen"] = True
@@ -873,15 +836,9 @@ async def check_user_live_status(browser, username):
                     "m3u8 detected"
                 )
 
-                # m3u8 confirms that a stream resource exists,
-                # but if Premium has already been confirmed,
-                # NEVER downgrade it to Normal.
                 if not stream_info["api_premium"]:
                     stream_info["stream_url"] = profile_url
 
-                    # This is provisional evidence.
-                    # Final classification is resolved after
-                    # the observation window.
                     if stream_info["status"] == StreamStatus.OFFLINE:
                         stream_info["status"] = (
                             StreamStatus.LIVE_NORMAL
@@ -902,7 +859,6 @@ async def check_user_live_status(browser, username):
             timeout=30000,
         )
 
-        # Encourage the player to initialize.
         try:
             await page.mouse.move(100, 100)
             await asyncio.sleep(0.5)
@@ -917,21 +873,11 @@ async def check_user_live_status(browser, username):
 
             await asyncio.sleep(POLL_INTERVAL)
 
-            # Premium is terminal and has priority.
             if stream_info["api_premium"]:
                 break
 
-            # An explicit normal API result is strong enough to
-            # finish early.
             if stream_info["api_normal"]:
                 break
-
-            # m3u8 alone remains provisional. We intentionally
-            # continue observing until the normal timeout so that
-            # a Premium API response has an opportunity to arrive.
-            #
-            # Therefore there is intentionally NO early exit here
-            # merely because m3u8 was seen.
 
     except Exception as exc:
         log(
@@ -940,10 +886,6 @@ async def check_user_live_status(browser, username):
 
     finally:
         await context.close()
-
-    # ------------------------------------------------------------
-    # Final classification
-    # ------------------------------------------------------------
 
     if stream_info["api_premium"]:
         final_status = StreamStatus.LIVE_PREMIUM
@@ -954,9 +896,6 @@ async def check_user_live_status(browser, username):
         final_url = profile_url
 
     elif stream_info["m3u8_seen"]:
-        # No explicit Premium API evidence was received during
-        # the observation window. m3u8 is therefore accepted as
-        # live-stream evidence.
         final_status = StreamStatus.LIVE_NORMAL
         final_url = profile_url
 
@@ -985,26 +924,16 @@ async def main():
 
     start_time = time.time()
 
-    # ------------------------------------------------------------
-    # Load watchlist
-    # ------------------------------------------------------------
-
     watchlist_data = await github_get_file(
         WATCHLIST_PATH
     )
 
-    if (
-        not watchlist_data
-        or not isinstance(watchlist_data, list)
-        or not watchlist_data
-    ):
+    if not watchlist_data or not isinstance(watchlist_data, list):
         log(
             "[MONITOR] Watchlist is empty or not found"
         )
         return 0
 
-    # Normalize usernames while preserving their original
-    # display form.
     watchlist = []
 
     for username in watchlist_data:
@@ -1028,10 +957,6 @@ async def main():
         f"[MONITOR] Found {total_watchlist} users in watchlist"
     )
 
-    # ------------------------------------------------------------
-    # Read genuinely active recordings
-    # ------------------------------------------------------------
-
     active_recordings = await github_get_active_recordings()
 
     active_usernames = {
@@ -1050,10 +975,6 @@ async def main():
         f"[MONITOR] Active usernames: "
         f"{sorted(active_usernames)}"
     )
-
-    # ------------------------------------------------------------
-    # Build list to check
-    # ------------------------------------------------------------
 
     users_to_check = []
 
@@ -1078,24 +999,15 @@ async def main():
         f"(skipped {skipped_active_count} already recording)"
     )
 
-    # ------------------------------------------------------------
-    # Statistics for EVERY checked user
-    # ------------------------------------------------------------
-
     stats = {
         "offline": 0,
         "live_normal": 0,
         "live_premium": 0,
     }
 
-    # This is separate from classification.
     recordings_triggered = 0
     recordings_failed = 0
     recordings_blocked_by_limit = 0
-
-    # ------------------------------------------------------------
-    # Check every user
-    # ------------------------------------------------------------
 
     results = []
 
@@ -1130,10 +1042,6 @@ async def main():
                         f"{username}: {exc}"
                     )
 
-                    # An unexpected check failure is kept as
-                    # OFFLINE for backward compatibility.
-                    # It is still counted, so the summary remains
-                    # internally consistent.
                     return (
                         username,
                         StreamStatus.OFFLINE,
@@ -1151,21 +1059,9 @@ async def main():
             for username in users_to_check
         ]
 
-        # IMPORTANT:
-        # gather waits for ALL users.
-        # No recording limit is applied here.
         results = await asyncio.gather(*tasks)
 
         await browser.close()
-
-    # ------------------------------------------------------------
-    # CLASSIFICATION PHASE
-    #
-    # Every checked user is counted BEFORE any recording is
-    # triggered. This guarantees:
-    #
-    # normal + premium + offline == checked users
-    # ------------------------------------------------------------
 
     normal_results = []
 
@@ -1187,7 +1083,6 @@ async def main():
         else:
             stats["offline"] += 1
 
-    # Safety invariant.
     classified_count = (
         stats["live_normal"]
         + stats["live_premium"]
@@ -1217,10 +1112,6 @@ async def main():
     )
     log("=" * 60)
 
-    # ------------------------------------------------------------
-    # RECORDING CAPACITY PHASE
-    # ------------------------------------------------------------
-
     available_slots = max(
         0,
         MAX_TOTAL_RECORDINGS - active_count,
@@ -1231,15 +1122,6 @@ async def main():
         f"{active_count}/{MAX_TOTAL_RECORDINGS} active, "
         f"{available_slots} slot(s) available"
     )
-
-    # IMPORTANT:
-    # We DO NOT break classification if there are more normal
-    # streams than available recording slots.
-    #
-    # All normal streams remain counted in stats.
-    #
-    # Only the actual triggering phase is limited.
-    # ------------------------------------------------------------
 
     for username, stream_url in normal_results:
 
@@ -1277,8 +1159,6 @@ async def main():
         if success:
             recordings_triggered += 1
 
-            # Reserve the slot locally immediately after a
-            # successful repository_dispatch.
             active_usernames.add(
                 username.lower()
             )
@@ -1289,6 +1169,9 @@ async def main():
                 f"({recordings_triggered}/"
                 f"{available_slots} new slots used)"
             )
+            
+            # ✅ تحسين الاستقرار: تأخير عشوائي لمنع تزاحم GitHub Actions و Admission Lock
+            await asyncio.sleep(random.uniform(1.5, 3.5))
 
         else:
             recordings_failed += 1
@@ -1297,10 +1180,6 @@ async def main():
                 f"[MONITOR] ❌ Failed to start recording "
                 f"for {username}"
             )
-
-    # ------------------------------------------------------------
-    # Final statistics
-    # ------------------------------------------------------------
 
     elapsed_total = time.time() - start_time
 
@@ -1366,10 +1245,6 @@ async def main():
 
     log("=" * 60)
 
-    # ------------------------------------------------------------
-    # Telegram summary
-    # ------------------------------------------------------------
-
     summary = (
         f"✅ انتهى الفحص في "
         f"{elapsed_total:.1f} ثانية.\n\n"
@@ -1406,10 +1281,6 @@ async def main():
         f"• ⚪ غير متصل: "
         f"{stats['offline']}\n\n"
     )
-
-    # ------------------------------------------------------------
-    # Recording result
-    # ------------------------------------------------------------
 
     if recordings_triggered > 0:
 
@@ -1449,7 +1320,6 @@ async def main():
                 "⚪ لم يتم بدء أي تسجيل جديد."
             )
 
-    # Additional diagnostic information only when relevant.
     if recordings_blocked_by_limit > 0:
 
         summary += (
