@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -36,16 +37,14 @@ DISCOVERY_TIMEOUT = 30
 PLAYLIST_TIMEOUT = 20
 SEGMENT_TIMEOUT = 30
 
-# ✅ تحسين #1: تقليل ضغط GitHub API (من 2 إلى 30 ثانية)
-STOP_CHECK_INTERVAL = 30.0  # فحص إشارة الإيقاف كل 30 ثانية
-PLAYLIST_POLL_INTERVAL = 3.0  # فحص قائمة التشغيل كل 3 ثوانٍ
+STOP_CHECK_INTERVAL = 30.0
+PLAYLIST_POLL_INTERVAL = 3.0
 
 MAX_PLAYLIST_RETRIES = 5
 MAX_SEGMENT_RETRIES = 3
 STATUS_UPDATE_INTERVAL = 60
 
-# ✅ تحسين #3: إعادة فتح الـ session كل 45 دقيقة
-SESSION_REFRESH_INTERVAL = 45 * 60  # 45 دقيقة
+SESSION_REFRESH_INTERVAL = 45 * 60
 
 STOP_FILE = f".recorder/stop/{RECORD_ID}"
 
@@ -61,9 +60,9 @@ stop_requested = False
 # ============================================================
 
 try:
-    MAX_ACTIVE_RECORDINGS = int(os.environ.get("MAX_ACTIVE_RECORDINGS", "5"))
+    MAX_ACTIVE_RECORDINGS = int(os.environ.get("MAX_ACTIVE_RECORDINGS", "10"))
 except Exception:
-    MAX_ACTIVE_RECORDINGS = 5
+    MAX_ACTIVE_RECORDINGS = 10
 
 try:
     ACTIVE_STALE_SECONDS = int(os.environ.get("ACTIVE_STALE_SECONDS", "10800"))
@@ -75,8 +74,6 @@ try:
 except Exception:
     ADMISSION_LOCK_TTL_SECONDS = 120
 
-# الإصلاح: لا تعتبر الأقفال وملفات الحالة القديمة دليلاً على تسجيل نشط لثلاث ساعات.
-# التسجيل الحي يحدّث الحالة كل 60 ثانية تقريبًا، لذلك نستخدم نافذة أقصر بكثير.
 GUARD_HEARTBEAT_FRESH_SECONDS = max(180, int(STATUS_UPDATE_INTERVAL * 10))
 USER_LOCK_TTL_SECONDS = min(ACTIVE_STALE_SECONDS, GUARD_HEARTBEAT_FRESH_SECONDS)
 ACTIVE_STATUS_FRESH_SECONDS = USER_LOCK_TTL_SECONDS
@@ -544,13 +541,10 @@ async def download_segment(session, url, path, headers):
         return False, None
 
 # ============================================================
-# Recording loop (مع تحسين Session Refresh)
+# Recording loop
 # ============================================================
 
 async def record_hls(playwright, context, page, playlist_url, initial_playlist, headers):
-    """
-    ✅ تحسين #3: Session Refresh كل 45 دقيقة لمنع Memory Leak
-    """
     global stop_requested
 
     log("[RECORDER] Starting HLS recording...")
@@ -589,7 +583,6 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
         while not stop_requested:
             stop_check_counter += 1
 
-            # ✅ تحسين #1: فحص الإيقاف كل 10 loops × 3s = 30 ثانية
             if stop_check_counter % 10 == 0:
                 if await check_stop():
                     break
@@ -621,7 +614,6 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
                 except Exception:
                     pass
 
-            # ✅ تحسين #3: إعادة فتح الـ session كل 45 دقيقة
             if time.time() - last_session_refresh > SESSION_REFRESH_INTERVAL:
                 log(f"[SESSION] 🔄 Refreshing browser session ({SESSION_REFRESH_INTERVAL // 60}min passed)...")
                 try:
@@ -749,7 +741,7 @@ async def record_hls(playwright, context, page, playlist_url, initial_playlist, 
     return segment_files, start_time_iso, recording_start_time
 
 # ============================================================
-# MP4 muxing (مع تحسين FFmpeg للبث الطويل)
+# MP4 muxing
 # ============================================================
 
 def create_concat_file(segment_files, filename="segments.txt"):
@@ -775,7 +767,6 @@ def mux_segments(segment_files):
 
     log(f"[MUX] Creating MP4: {output_file}")
 
-    # ✅ تحسين #2: FFmpeg flags للبثوث الطويلة
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
         "-fflags", "+discardcorrupt+genpts",
@@ -817,7 +808,6 @@ def mux_part(segment_files, part_number):
     concat_name = f"part_{part_number:03d}.txt"
     concat_file = create_concat_file(segment_files, concat_name)
 
-    # ✅ تحسين #2: نفس الـ flags للبثوث الطويلة
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-fflags", "+discardcorrupt+genpts",
@@ -1053,9 +1043,6 @@ async def send_video_file(file_path, part_number=None, total_parts=None):
     return False
 
 async def send_recording(output_file, segment_files, duration_seconds):
-    """
-    ✅ تحسين #4: إحصائيات مفصلة في رسالة Telegram النهائية
-    """
     if not output_file or not output_file.exists():
         log(f"[TELEGRAM] Final MP4 does not exist: {output_file}")
         return False
@@ -1891,7 +1878,7 @@ async def _guard_delete_file(path, message, sha=None):
     status, _ = await _guard_github_api_request("DELETE", path, body)
     return status in (200, 204)
 
-async def _guard_acquire_admission_lock(timeout_seconds=120):
+async def _guard_acquire_admission_lock(timeout_seconds=300):
     if not GITHUB_TOKEN:
         return True
 
@@ -1901,6 +1888,10 @@ async def _guard_acquire_admission_lock(timeout_seconds=120):
     while time.time() - started < timeout_seconds:
         if await check_stop():
             return False
+
+        # إضافة تأخير عشوائي بسيط (Jitter) لمنع تزاحم العمليات التي تبدأ في نفس الثانية
+        if attempt > 0:
+            await asyncio.sleep(random.uniform(0.5, 2.5))
 
         status, obj, sha = await _guard_get_file(ADMISSION_LOCK_FILE)
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -1936,7 +1927,7 @@ async def _guard_acquire_admission_lock(timeout_seconds=120):
                 if ok:
                     return True
 
-        await asyncio.sleep(min(5, 1 + attempt))
+        await asyncio.sleep(min(5, 2 + attempt))
         attempt += 1
 
     return False
@@ -1960,21 +1951,12 @@ async def _guard_release_admission_lock():
         log(f"[GUARD] Could not release admission lock: {exc}")
 
 async def _guard_is_record_active(record_id, active_obj):
-    """
-    الإصلاح الجوهري:
-    لا يعتبر أي ملف حالة قديم دليلاً كافياً على تسجيل نشط.
-    الحالة النشطة يجب أن تكون مدعومة بواحد مما يلي:
-    1. ملف status حديث.
-    2. ملف active داخل فترة سماح البداية فقط.
-    3. قفل مستخدم حديث مرتبط فعلياً بملف نشط/حالة قابلة للتحقق.
-    """
     if not record_id:
         return False
 
     try:
         status_status, status_obj, _ = await _guard_get_file(f"{STATUS_DIR}/{record_id}.json")
 
-        # إذا تعذر التحقق من الحالة، نتصرف بتحفظ ولا نعتبر التسجيل ميتاً.
         if status_status is None or (status_status not in (200, 404)):
             return True
 
@@ -2171,7 +2153,6 @@ async def _guard_count_active_records():
                 if await _guard_is_record_active(record_id, active_obj):
                     active_ids.add(record_id)
             elif status != 404:
-                # إذا تعذر التحقق من ملف الحالة، نحسبه بحذر لتجاوز الحد الآمن.
                 active_ids.add(record_id)
 
         lock_names = await _guard_list_dir(USER_LOCK_DIR)
@@ -2190,12 +2171,10 @@ async def _guard_count_active_records():
                 if record_id in active_ids:
                     continue
 
-                # الإصلاح: لا نعد قفل المستخدم وحده دليلاً على تسجيل نشط.
                 if await _guard_is_record_active(record_id, None):
                     active_ids.add(record_id)
 
             elif status != 404:
-                # إذا تعذر التحقق من القفل، نحسبه بحذر.
                 active_ids.add(f"unknown-lock:{name}")
 
     except Exception as exc:
@@ -2352,7 +2331,7 @@ async def _acquire_broadcast_slot():
 
         identity = _guard_identity_key()
 
-        admission_ok = await _guard_acquire_admission_lock(timeout_seconds=120)
+        admission_ok = await _guard_acquire_admission_lock(timeout_seconds=300)
         if not admission_ok:
             log("[GUARD] Could not acquire admission lock; refusing to start to avoid race conditions.")
             return False
