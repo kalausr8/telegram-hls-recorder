@@ -2,9 +2,9 @@
   "record_id": "T3IUMD",
   "url": "https://www.tango.me/helinx",
   "username": "helinx",
-  "duration_seconds": 128,
-  "segments_count": 127,
-  "size_mb": 35.2,
+  "duration_seconds": 256,
+  "segments_count": 255,
+  "size_mb": 70.64,
   "hls_status": "recording",
-  "updated_at": "2026-10-23T20:28:23.093084+00:00"
+  "updated_at": "2026-10-23T20:30:31.177583+00:00"
 }
