@@ -2,9 +2,9 @@
   "record_id": "IVHCYA",
   "url": "https://www.tango.me/helinx",
   "username": "helinx",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 18.13,
   "hls_status": "recording",
-  "updated_at": "2026-10-23T15:29:03.063170+00:00"
+  "updated_at": "2026-10-23T15:30:06.248313+00:00"
 }
