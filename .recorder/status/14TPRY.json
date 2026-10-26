@@ -2,9 +2,9 @@
   "record_id": "14TPRY",
   "url": "https://www.tango.me/bas-1380",
   "username": "bas-1380",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 63,
+  "size_mb": 17.95,
   "hls_status": "recording",
-  "updated_at": "2026-10-26T21:04:43.154695+00:00"
+  "updated_at": "2026-10-26T21:05:46.205970+00:00"
 }
