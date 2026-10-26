@@ -2,9 +2,9 @@
   "record_id": "INWRZK",
   "url": "https://www.tango.me/helinx",
   "username": "helinx",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 65,
+  "segments_count": 65,
+  "size_mb": 10.29,
   "hls_status": "recording",
-  "updated_at": "2026-10-26T14:13:26.255380+00:00"
+  "updated_at": "2026-10-26T14:14:29.885638+00:00"
 }
