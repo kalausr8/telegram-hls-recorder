@@ -2,9 +2,9 @@
   "record_id": "FTL52L",
   "url": "https://www.tango.me/helinx",
   "username": "helinx",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 65,
+  "segments_count": 64,
+  "size_mb": 17.75,
   "hls_status": "recording",
-  "updated_at": "2026-10-27T14:21:40.067050+00:00"
+  "updated_at": "2026-10-27T14:22:43.733742+00:00"
 }
