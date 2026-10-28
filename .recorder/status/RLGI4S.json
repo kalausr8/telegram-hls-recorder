@@ -2,9 +2,9 @@
   "record_id": "RLGI4S",
   "url": "https://www.tango.me/bas-1380",
   "username": "bas-1380",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 128,
+  "segments_count": 127,
+  "size_mb": 36.26,
   "hls_status": "recording",
-  "updated_at": "2026-10-28T23:09:13.638220+00:00"
+  "updated_at": "2026-10-28T23:11:20.892797+00:00"
 }
