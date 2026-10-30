@@ -2,9 +2,9 @@
   "record_id": "FBQDPS",
   "url": "https://www.tango.me/halla3",
   "username": "halla3",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 65,
+  "segments_count": 65,
+  "size_mb": 18.32,
   "hls_status": "recording",
-  "updated_at": "2026-10-30T12:23:54.501014+00:00"
+  "updated_at": "2026-10-30T12:24:59.024654+00:00"
 }
