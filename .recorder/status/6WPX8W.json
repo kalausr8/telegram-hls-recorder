@@ -2,9 +2,9 @@
   "record_id": "6WPX8W",
   "url": "https://www.tango.me/ksa339",
   "username": "ksa339",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 123,
+  "segments_count": 123,
+  "size_mb": 35.03,
   "hls_status": "recording",
-  "updated_at": "2026-10-30T20:32:46.897822+00:00"
+  "updated_at": "2026-10-30T20:34:49.462126+00:00"
 }
