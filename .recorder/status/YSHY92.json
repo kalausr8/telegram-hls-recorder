@@ -2,9 +2,9 @@
   "record_id": "YSHY92",
   "url": "https://www.tango.me/helinx",
   "username": "helinx",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 18.21,
   "hls_status": "recording",
-  "updated_at": "2026-10-31T00:43:27.232339+00:00"
+  "updated_at": "2026-10-31T00:44:30.498624+00:00"
 }
