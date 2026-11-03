@@ -2,9 +2,5 @@
   "record_id": "BITSLI",
   "url": "https://www.tango.me/helinx",
   "username": "helinx",
-  "identity": "helinx",
-  "started_at": "2026-11-03T19:14:57.940753+00:00",
-  "updated_at": "2026-11-03T19:14:57.940753+00:00",
-  "hls_status": "reserved",
-  "source": "record_once_guard"
+  "started_at": "2026-11-03T19:15:08.462940+00:00"
 }
