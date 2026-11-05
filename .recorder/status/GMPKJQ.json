@@ -2,9 +2,9 @@
   "record_id": "GMPKJQ",
   "url": "https://www.tango.me/wes-326",
   "username": "wes-326",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 18.16,
   "hls_status": "recording",
-  "updated_at": "2026-11-05T12:14:22.385965+00:00"
+  "updated_at": "2026-11-05T12:15:26.115009+00:00"
 }
