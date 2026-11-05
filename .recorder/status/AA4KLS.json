@@ -2,9 +2,9 @@
   "record_id": "AA4KLS",
   "url": "https://www.tango.me/helinx",
   "username": "helinx",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 65,
+  "segments_count": 63,
+  "size_mb": 10.74,
   "hls_status": "recording",
-  "updated_at": "2026-11-05T18:39:23.197485+00:00"
+  "updated_at": "2026-11-05T18:40:27.038187+00:00"
 }
