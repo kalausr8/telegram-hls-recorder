@@ -2,9 +2,9 @@
   "record_id": "TMATBL",
   "url": "https://www.tango.me/halla3",
   "username": "halla3",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 18.21,
   "hls_status": "recording",
-  "updated_at": "2026-11-09T13:35:20.240001+00:00"
+  "updated_at": "2026-11-09T13:36:23.141145+00:00"
 }
