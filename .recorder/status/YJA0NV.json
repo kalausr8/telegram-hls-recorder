@@ -2,9 +2,9 @@
   "record_id": "YJA0NV",
   "url": "https://www.tango.me/wes-326",
   "username": "wes-326",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 18.24,
   "hls_status": "recording",
-  "updated_at": "2026-11-09T07:57:13.886371+00:00"
+  "updated_at": "2026-11-09T07:58:17.108149+00:00"
 }
