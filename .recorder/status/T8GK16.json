@@ -2,9 +2,9 @@
   "record_id": "T8GK16",
   "url": "https://www.tango.me/mooni",
   "username": "mooni",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 63,
+  "segments_count": 64,
+  "size_mb": 18.31,
   "hls_status": "recording",
-  "updated_at": "2026-11-10T12:00:13.368303+00:00"
+  "updated_at": "2026-11-10T12:01:15.623914+00:00"
 }
