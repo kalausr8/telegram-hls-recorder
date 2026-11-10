@@ -2,9 +2,9 @@
   "record_id": "QJNRQC",
   "url": "https://www.tango.me/unknown-penguin-88184",
   "username": "unknown-penguin-88184",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 123,
+  "segments_count": 122,
+  "size_mb": 32.81,
   "hls_status": "recording",
-  "updated_at": "2026-11-10T19:21:15.893557+00:00"
+  "updated_at": "2026-11-10T19:23:18.138246+00:00"
 }
