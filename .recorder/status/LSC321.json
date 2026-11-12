@@ -2,9 +2,9 @@
   "record_id": "LSC321",
   "url": "https://www.tango.me/souso2000",
   "username": "souso2000",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 65,
+  "segments_count": 64,
+  "size_mb": 18.21,
   "hls_status": "recording",
-  "updated_at": "2026-11-12T21:33:12.728187+00:00"
+  "updated_at": "2026-11-12T21:34:16.968520+00:00"
 }
