@@ -2,9 +2,9 @@
   "record_id": "QKUR16",
   "url": "https://www.tango.me/bas-1380",
   "username": "bas-1380",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 17.92,
   "hls_status": "recording",
-  "updated_at": "2026-11-12T20:30:21.806008+00:00"
+  "updated_at": "2026-11-12T20:31:24.876583+00:00"
 }
