@@ -2,9 +2,9 @@
   "record_id": "9BCJXV",
   "url": "https://www.tango.me/tattoo",
   "username": "tattoo",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 63,
+  "size_mb": 17.62,
   "hls_status": "recording",
-  "updated_at": "2026-11-12T01:28:01.080771+00:00"
+  "updated_at": "2026-11-12T01:29:04.601478+00:00"
 }
