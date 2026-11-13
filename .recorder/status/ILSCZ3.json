@@ -2,9 +2,9 @@
   "record_id": "ILSCZ3",
   "url": "https://www.tango.me/helinx",
   "username": "helinx",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 65,
+  "segments_count": 65,
+  "size_mb": 10.23,
   "hls_status": "recording",
-  "updated_at": "2026-11-13T09:22:58.454798+00:00"
+  "updated_at": "2026-11-13T09:24:02.477058+00:00"
 }
