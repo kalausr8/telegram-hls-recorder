@@ -2,9 +2,9 @@
   "record_id": "HBQN8K",
   "url": "https://www.tango.me/anoucha",
   "username": "anoucha",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 32,
+  "size_mb": 20.24,
   "hls_status": "recording",
-  "updated_at": "2026-11-13T19:54:01.041137+00:00"
+  "updated_at": "2026-11-13T19:55:04.646302+00:00"
 }
