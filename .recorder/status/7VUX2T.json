@@ -2,9 +2,9 @@
   "record_id": "7VUX2T",
   "url": "https://www.tango.me/gazal1",
   "username": "gazal1",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 0.53,
   "hls_status": "recording",
-  "updated_at": "2026-11-14T07:55:18.249533+00:00"
+  "updated_at": "2026-11-14T07:56:22.144749+00:00"
 }
