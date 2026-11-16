@@ -2,9 +2,9 @@
   "record_id": "V5AY2F",
   "url": "https://www.tango.me/bas-1380",
   "username": "bas-1380",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 17.86,
   "hls_status": "recording",
-  "updated_at": "2026-11-16T01:39:00.189226+00:00"
+  "updated_at": "2026-11-16T01:40:03.845832+00:00"
 }
