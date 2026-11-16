@@ -2,9 +2,9 @@
   "record_id": "EP1E36",
   "url": "https://www.tango.me/bas-1380",
   "username": "bas-1380",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 65,
+  "size_mb": 17.82,
   "hls_status": "recording",
-  "updated_at": "2026-11-16T15:18:16.696865+00:00"
+  "updated_at": "2026-11-16T15:19:20.016720+00:00"
 }
