@@ -2,9 +2,9 @@
   "record_id": "U7FITS",
   "url": "https://www.tango.me/angel-7150",
   "username": "angel-7150",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 62,
+  "segments_count": 52,
+  "size_mb": 20.84,
   "hls_status": "recording",
-  "updated_at": "2026-11-17T15:56:54.093295+00:00"
+  "updated_at": "2026-11-17T15:57:55.558918+00:00"
 }
