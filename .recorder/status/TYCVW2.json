@@ -2,9 +2,9 @@
   "record_id": "TYCVW2",
   "url": "https://www.tango.me/amazon35",
   "username": "amazon35",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 52,
+  "size_mb": 18.36,
   "hls_status": "recording",
-  "updated_at": "2026-11-18T06:09:39.386205+00:00"
+  "updated_at": "2026-11-18T06:10:42.214275+00:00"
 }
