@@ -2,9 +2,9 @@
   "record_id": "SW1LZ8",
   "url": "https://www.tango.me/soso111",
   "username": "soso111",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 17.85,
   "hls_status": "recording",
-  "updated_at": "2026-11-19T23:46:31.172823+00:00"
+  "updated_at": "2026-11-19T23:47:34.816349+00:00"
 }
