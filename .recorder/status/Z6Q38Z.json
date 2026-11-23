@@ -2,9 +2,9 @@
   "record_id": "Z6Q38Z",
   "url": "https://www.tango.me/44lm",
   "username": "44lm",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 18.24,
   "hls_status": "recording",
-  "updated_at": "2026-11-23T10:46:01.734562+00:00"
+  "updated_at": "2026-11-23T10:47:04.846512+00:00"
 }
