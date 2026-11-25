@@ -2,9 +2,9 @@
   "record_id": "UIAMQ4",
   "url": "https://www.tango.me/halla3",
   "username": "halla3",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 65,
+  "size_mb": 18.54,
   "hls_status": "recording",
-  "updated_at": "2026-11-25T21:46:09.497684+00:00"
+  "updated_at": "2026-11-25T21:47:13.352538+00:00"
 }
