@@ -2,9 +2,9 @@
   "record_id": "DROS71",
   "url": "https://www.tango.me/mooni",
   "username": "mooni",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 63,
+  "segments_count": 63,
+  "size_mb": 17.98,
   "hls_status": "recording",
-  "updated_at": "2026-11-27T13:55:06.514988+00:00"
+  "updated_at": "2026-11-27T13:56:08.412545+00:00"
 }
