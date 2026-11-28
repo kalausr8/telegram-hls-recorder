@@ -2,9 +2,9 @@
   "record_id": "FWBKGH",
   "url": "https://www.tango.me/helinx",
   "username": "helinx",
-  "duration_seconds": 1,
-  "segments_count": 0,
-  "size_mb": 0.0,
+  "duration_seconds": 64,
+  "segments_count": 64,
+  "size_mb": 18.26,
   "hls_status": "recording",
-  "updated_at": "2026-11-28T15:01:55.400796+00:00"
+  "updated_at": "2026-11-28T15:02:58.372390+00:00"
 }
